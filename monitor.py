@@ -507,7 +507,7 @@ def cmd_history(chat_id, inst):
 
 def get_nginx_stats(inst):
     """Get nginx connection stats."""
-    cmd = "curl -s http://localhost/nginx_status 2>&1 || echo 'stub_status not configured'"
+    cmd = "curl -sk https://127.0.0.1/nginx_status 2>&1 || echo 'stub_status not configured'"
     if inst["is_local"]:
         import subprocess
         try:
@@ -526,7 +526,6 @@ def cmd_nginx(chat_id, inst):
         send_message(chat_id, f"⚠️ *{inst['name']} — Nginx Stats*\n\n`{output}`\n\n_Enable stub_status in nginx config_")
         return
     
-    lines = output.split('\n')
     msg = f"🌐 *{inst['name']} — Nginx Stats*\n\n```\n{output}\n```"
     send_message(chat_id, msg)
 
