@@ -299,6 +299,7 @@ def cmd_help(chat_id, inst):
         "/disk       — Disk usage details\n"
         "/network    — Network sent/received stats\n"
         "/processes  — Top 5 processes by CPU\n"
+        "/docker     — Running Docker containers\n"
         "/uptime     — Server uptime\n"
         "/alerts     — View current alert thresholds\n"
         "/history    — Last 5 logged metric entries\n"
@@ -435,6 +436,46 @@ def cmd_alerts(chat_id, inst):
     send_message(chat_id, msg)
 
 
+def get_docker_containers(inst):
+    """Get running Docker containers — local subprocess or remote SSH."""
+    cmd = "docker ps --format '{{.ID}}|{{.Names}}|{{.Status}}|{{.Image}}' 2>&1"
+    if inst["is_local"]:
+        import subprocess
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            output = result.stdout.strip()
+        except Exception as e:
+            return None, str(e)
+    else:
+        output = ssh_run(inst, cmd)
+        if output is None:
+            return None, "SSH error"
+
+    if not output or output.startswith("Cannot connect") or "permission denied" in output.lower():
+        return None, output or "Docker unavailable"
+
+    containers = []
+    for line in output.splitlines():
+        parts = line.split("|")
+        if len(parts) == 4:
+            containers.append({"id": parts[0], "name": parts[1], "status": parts[2], "image": parts[3]})
+    return containers, None
+
+
+def cmd_docker(chat_id, inst):
+    containers, err = get_docker_containers(inst)
+    if containers is None:
+        send_message(chat_id, f"❌ *{inst['name']}* — Docker check failed: `{err}`")
+        return
+    if not containers:
+        send_message(chat_id, f"🐳 *{inst['name']}* — No running containers.")
+        return
+    lines = [f"{i}. `{c['name']}` (`{c['id'][:12]}`)\n   {c['status']}\n   Image: `{c['image']}`"
+             for i, c in enumerate(containers, 1)]
+    msg = f"🐳 *{inst['name']} — Docker Containers ({len(containers)} running)*\n\n" + "\n\n".join(lines)
+    send_message(chat_id, msg)
+
+
 def cmd_history(chat_id, inst):
     log_file = os.path.join(os.path.dirname(__file__), "metrics_log.csv")
     if not os.path.isfile(log_file):
@@ -472,6 +513,7 @@ COMMANDS = {
     "/disk":      cmd_disk,
     "/network":   cmd_network,
     "/processes": cmd_processes,
+    "/docker":    cmd_docker,
     "/uptime":    cmd_uptime,
     "/alerts":    cmd_alerts,
     "/history":   cmd_history,
