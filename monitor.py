@@ -300,6 +300,10 @@ def cmd_help(chat_id, inst):
         "/network    — Network sent/received stats\n"
         "/processes  — Top 5 processes by CPU\n"
         "/docker     — Running Docker containers\n"
+        "/nginx      — Nginx connection stats\n"
+        "/services   — Status of critical services\n"
+        "/zombie     — Check for zombie processes\n"
+        "/logs       — Recent system logs\n"
         "/uptime     — Server uptime\n"
         "/alerts     — View current alert thresholds\n"
         "/history    — Last 5 logged metric entries\n"
@@ -501,6 +505,124 @@ def cmd_history(chat_id, inst):
         send_message(chat_id, f"❌ Could not read log: {e}")
 
 
+def get_nginx_stats(inst):
+    """Get nginx connection stats."""
+    cmd = "curl -s http://localhost/nginx_status 2>&1 || echo 'stub_status not configured'"
+    if inst["is_local"]:
+        import subprocess
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            return result.stdout.strip()
+        except Exception as e:
+            return f"Error: {e}"
+    else:
+        output = ssh_run(inst, cmd)
+        return output if output else "SSH error"
+
+
+def cmd_nginx(chat_id, inst):
+    output = get_nginx_stats(inst)
+    if "stub_status not configured" in output or "SSH error" in output or "Error:" in output:
+        send_message(chat_id, f"⚠️ *{inst['name']} — Nginx Stats*\n\n`{output}`\n\n_Enable stub_status in nginx config_")
+        return
+    
+    lines = output.split('\n')
+    msg = f"🌐 *{inst['name']} — Nginx Stats*\n\n```\n{output}\n```"
+    send_message(chat_id, msg)
+
+
+def get_zombie_processes(inst):
+    """Count zombie processes."""
+    cmd = "ps aux | awk '$8==\"Z\" {print $2, $11}' | wc -l"
+    if inst["is_local"]:
+        import subprocess
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            return result.stdout.strip()
+        except Exception as e:
+            return None
+    else:
+        return ssh_run(inst, cmd)
+
+
+def cmd_zombie(chat_id, inst):
+    count = get_zombie_processes(inst)
+    if count is None:
+        send_message(chat_id, f"❌ Could not check zombie processes for *{inst['name']}*.")
+        return
+    
+    count = int(count.strip())
+    if count == 0:
+        msg = f"✅ *{inst['name']} — Zombie Processes*\n\n  No zombie processes found."
+    else:
+        msg = f"⚠️ *{inst['name']} — Zombie Processes*\n\n  Found: `{count}` zombie process(es)"
+    send_message(chat_id, msg)
+
+
+def get_service_status(inst, services):
+    """Check status of multiple services."""
+    results = {}
+    for svc in services:
+        cmd = f"systemctl is-active {svc} 2>&1"
+        if inst["is_local"]:
+            import subprocess
+            try:
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+                results[svc] = result.stdout.strip()
+            except Exception:
+                results[svc] = "unknown"
+        else:
+            output = ssh_run(inst, cmd)
+            results[svc] = output.strip() if output else "unknown"
+    return results
+
+
+def cmd_services(chat_id, inst):
+    services = ["nginx", "docker", "ssh"]
+    if not inst["is_local"]:
+        services.append("sshd")
+    
+    statuses = get_service_status(inst, services)
+    lines = []
+    for svc, status in statuses.items():
+        if status == "active":
+            icon = "✅"
+        elif status == "inactive":
+            icon = "⚠️"
+        else:
+            icon = "❌"
+        lines.append(f"{icon} `{svc}`: `{status}`")
+    
+    msg = f"⚙️ *{inst['name']} — Service Status*\n\n" + "\n".join(lines)
+    send_message(chat_id, msg)
+
+
+def get_recent_logs(inst, log_path="/var/log/syslog", lines=20):
+    """Get recent log entries."""
+    cmd = f"tail -n {lines} {log_path} 2>&1 || echo 'Log file not accessible'"
+    if inst["is_local"]:
+        import subprocess
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=5)
+            return result.stdout.strip()
+        except Exception as e:
+            return f"Error: {e}"
+    else:
+        output = ssh_run(inst, cmd)
+        return output if output else "SSH error"
+
+
+def cmd_logs(chat_id, inst):
+    log_path = "C:\\Windows\\System32\\winevt\\Logs\\System.evtx" if inst["is_windows"] else "/var/log/syslog"
+    output = get_recent_logs(inst, log_path, 15)
+    
+    if len(output) > 3000:
+        output = output[-3000:]
+    
+    msg = f"📋 *{inst['name']} — Recent Logs*\n\n```\n{output}\n```"
+    send_message(chat_id, msg)
+
+
 # ─── COMMAND ROUTER ───────────────────────────────────────
 
 COMMANDS = {
@@ -517,6 +639,10 @@ COMMANDS = {
     "/uptime":    cmd_uptime,
     "/alerts":    cmd_alerts,
     "/history":   cmd_history,
+    "/nginx":     cmd_nginx,
+    "/zombie":    cmd_zombie,
+    "/services":  cmd_services,
+    "/logs":      cmd_logs,
 }
 
 
