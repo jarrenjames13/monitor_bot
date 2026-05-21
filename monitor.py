@@ -9,11 +9,16 @@ import csv
 import threading
 from datetime import datetime
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 
 # ─── LOAD ENV ─────────────────────────────────────────────
 load_dotenv()
+PH_TZ = ZoneInfo("Asia/Manila")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+def now_ph():
+    return datetime.now(PH_TZ)
 
 CPU_ALERT_THRESHOLD    = int(os.getenv("CPU_ALERT_THRESHOLD", 80))
 MEMORY_ALERT_THRESHOLD = int(os.getenv("MEMORY_ALERT_THRESHOLD", 85))
@@ -165,8 +170,8 @@ def get_local_metrics():
     memory = psutil.virtual_memory()
     disk   = psutil.disk_usage('/')
     net    = psutil.net_io_counters()
-    boot   = datetime.fromtimestamp(psutil.boot_time())
-    uptime = datetime.now() - boot
+    boot   = datetime.fromtimestamp(psutil.boot_time(), PH_TZ)
+    uptime = now_ph() - boot
 
     return {
         "cpu":        cpu,
@@ -191,8 +196,10 @@ def build_metrics_cmd(is_windows):
         "mem=psutil.virtual_memory();"
         f"disk=psutil.disk_usage('{disk}');"
         "net=psutil.net_io_counters();"
-        "boot=datetime.datetime.fromtimestamp(psutil.boot_time());"
-        "uptime=str(datetime.datetime.now()-boot).split('.')[0];"
+        "from zoneinfo import ZoneInfo;"
+        "tz=ZoneInfo('Asia/Manila');"
+        "boot=datetime.datetime.fromtimestamp(psutil.boot_time(), tz);"
+        "uptime=str(datetime.datetime.now(tz)-boot).split('.')[0];"
         "print(json.dumps({"
         "'cpu':psutil.cpu_percent(interval=1),"
         "'mem_used':mem.percent,"
@@ -317,7 +324,7 @@ def cmd_status(chat_id, inst):
     if m is None:
         send_message(chat_id, f"❌ *{inst['name']}* is unreachable.")
         return
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = now_ph().strftime("%Y-%m-%d %H:%M:%S")
     msg = (
         f"🖥 *{inst['name']} — Quick Status*\n"
         f"🕐 `{timestamp}`\n\n"
@@ -331,7 +338,7 @@ def cmd_report(chat_id, inst):
     if m is None:
         send_message(chat_id, f"❌ *{inst['name']}* is unreachable.")
         return
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = now_ph().strftime("%Y-%m-%d %H:%M:%S")
     msg = (
         f"📊 *{inst['name']} — Full Report*\n"
         f"🕐 `{timestamp}`\n\n"
@@ -525,7 +532,7 @@ def cmd_nginx(chat_id, inst):
     if "stub_status not configured" in output or "SSH error" in output or "Error:" in output:
         send_message(chat_id, f"⚠️ *{inst['name']} — Nginx Stats*\n\n`{output}`\n\n_Enable stub_status in nginx config_")
         return
-    
+
     msg = f"🌐 *{inst['name']} — Nginx Stats*\n\n```\n{output}\n```"
     send_message(chat_id, msg)
 
@@ -549,7 +556,7 @@ def cmd_zombie(chat_id, inst):
     if count is None:
         send_message(chat_id, f"❌ Could not check zombie processes for *{inst['name']}*.")
         return
-    
+
     count = int(count.strip())
     if count == 0:
         msg = f"✅ *{inst['name']} — Zombie Processes*\n\n  No zombie processes found."
@@ -580,7 +587,7 @@ def cmd_services(chat_id, inst):
     services = ["nginx", "docker", "ssh"]
     if not inst["is_local"]:
         services.append("sshd")
-    
+
     statuses = get_service_status(inst, services)
     lines = []
     for svc, status in statuses.items():
@@ -591,7 +598,7 @@ def cmd_services(chat_id, inst):
         else:
             icon = "❌"
         lines.append(f"{icon} `{svc}`: `{status}`")
-    
+
     msg = f"⚙️ *{inst['name']} — Service Status*\n\n" + "\n".join(lines)
     send_message(chat_id, msg)
 
@@ -614,10 +621,10 @@ def get_recent_logs(inst, log_path="/var/log/syslog", lines=20):
 def cmd_logs(chat_id, inst):
     log_path = "C:\\Windows\\System32\\winevt\\Logs\\System.evtx" if inst["is_windows"] else "/var/log/syslog"
     output = get_recent_logs(inst, log_path, 15)
-    
+
     if len(output) > 3000:
         output = output[-3000:]
-    
+
     msg = f"📋 *{inst['name']} — Recent Logs*\n\n```\n{output}\n```"
     send_message(chat_id, msg)
 
@@ -688,7 +695,7 @@ def handle_commands():
 # ─── SCHEDULED TASKS ──────────────────────────────────────
 
 def send_scheduled_reports():
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = now_ph().strftime("%Y-%m-%d %H:%M:%S")
     for inst in INSTANCES:
         m = get_metrics(inst)
         if m is None:
@@ -709,7 +716,7 @@ def send_scheduled_reports():
 
 
 def check_all_alerts():
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = now_ph().strftime("%Y-%m-%d %H:%M:%S")
     for inst in INSTANCES:
         m = get_metrics(inst)
         if m is None:
@@ -733,7 +740,7 @@ def check_all_alerts():
 
 def log_all_metrics():
     log_file   = os.path.join(os.path.dirname(__file__), "metrics_log.csv")
-    timestamp  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp  = now_ph().strftime("%Y-%m-%d %H:%M:%S")
     fieldnames = ['instance', 'timestamp', 'cpu', 'mem_used', 'mem_total',
                   'disk_used', 'disk_total', 'net_sent', 'net_recv', 'uptime']
     file_exists = os.path.isfile(log_file)
@@ -765,7 +772,7 @@ def log_all_metrics():
 
 # ─── MAIN ─────────────────────────────────────────────────
 
-schedule.every(REPORT_INTERVAL).minutes.do(send_scheduled_reports)
+# schedule.every(REPORT_INTERVAL).minutes.do(send_scheduled_reports)
 schedule.every(1).minutes.do(check_all_alerts)
 schedule.every(5).minutes.do(log_all_metrics)
 
@@ -791,7 +798,7 @@ for inst in INSTANCES:
         f"Type /help for available commands."
     )
 
-send_scheduled_reports()
+# send_scheduled_reports()
 log_all_metrics()
 
 print("Monitor running... Press Ctrl+C to stop.")
