@@ -166,12 +166,13 @@ def ssh_run(inst, cmd):
 
 def get_local_metrics():
     """Get metrics directly using psutil — no SSH needed."""
-    cpu    = psutil.cpu_percent(interval=1)
-    memory = psutil.virtual_memory()
-    disk   = psutil.disk_usage('/')
-    net    = psutil.net_io_counters()
-    boot   = datetime.fromtimestamp(psutil.boot_time(), PH_TZ)
-    uptime = now_ph() - boot
+    per_core = psutil.cpu_percent(interval=3, percpu=True)  # single 3s blocking call
+    cpu      = round(sum(per_core) / len(per_core), 1)      # derive overall from cores
+    memory   = psutil.virtual_memory()
+    disk     = psutil.disk_usage('/')
+    net      = psutil.net_io_counters()
+    boot     = datetime.fromtimestamp(psutil.boot_time(), PH_TZ)
+    uptime   = now_ph() - boot
 
     return {
         "cpu":        cpu,
@@ -182,17 +183,19 @@ def get_local_metrics():
         "net_sent":   round(net.bytes_sent / (1024**2), 1),
         "net_recv":   round(net.bytes_recv / (1024**2), 1),
         "uptime":     str(uptime).split('.')[0],
-        "per_core":   psutil.cpu_percent(interval=1, percpu=True)
+        "per_core":   per_core,
     }
 
 
 def build_metrics_cmd(is_windows):
     """Build the remote metrics command for Linux or Windows."""
-    python  = "python" if is_windows else "python3"
-    disk    = "C:\\\\" if is_windows else "/"
+    python = "python" if is_windows else "python3"
+    disk   = "C:\\\\" if is_windows else "/"
     return (
         f"{python} -c \""
         "import psutil, json, datetime;"
+        "per_core=psutil.cpu_percent(interval=3,percpu=True);"  # single call
+        "cpu=round(sum(per_core)/len(per_core),1);"             # derive overall
         "mem=psutil.virtual_memory();"
         f"disk=psutil.disk_usage('{disk}');"
         "net=psutil.net_io_counters();"
@@ -201,7 +204,7 @@ def build_metrics_cmd(is_windows):
         "boot=datetime.datetime.fromtimestamp(psutil.boot_time(), tz);"
         "uptime=str(datetime.datetime.now(tz)-boot).split('.')[0];"
         "print(json.dumps({"
-        "'cpu':psutil.cpu_percent(interval=1),"
+        "'cpu':cpu,"
         "'mem_used':mem.percent,"
         "'mem_total':round(mem.total/(1024**3),1),"
         "'disk_used':disk.percent,"
@@ -209,7 +212,7 @@ def build_metrics_cmd(is_windows):
         "'net_sent':round(net.bytes_sent/(1024**2),1),"
         "'net_recv':round(net.bytes_recv/(1024**2),1),"
         "'uptime':uptime,"
-        "'per_core':psutil.cpu_percent(interval=1,percpu=True)"
+        "'per_core':per_core"
         "}))\""
     )
 
@@ -716,19 +719,50 @@ def send_scheduled_reports():
 
 
 def check_all_alerts():
+    threading.Thread(target=_check_all_alerts_worker, daemon=True).start()
+
+def _check_all_alerts_worker():
     timestamp = now_ph().strftime("%Y-%m-%d %H:%M:%S")
     for inst in INSTANCES:
-        m = get_metrics(inst)
-        if m is None:
+        m1 = get_metrics(inst)
+        if m1 is None:
             send_message(inst['chat_id'], f"🔴 *{inst['name']}* is *unreachable!*\n🕐 `{timestamp}`")
             continue
+
+        needs_confirm = (
+            m1['cpu']       >= CPU_ALERT_THRESHOLD or
+            m1['mem_used']  >= MEMORY_ALERT_THRESHOLD or
+            m1['disk_used'] >= DISK_ALERT_THRESHOLD
+        )
+
+        if not needs_confirm:
+            continue
+
+        print(
+            f"[{timestamp}] Possible alert on {inst['name']}, confirming in 15s... "
+            f"(CPU: {m1['cpu']}%, MEM: {m1['mem_used']}%, DISK: {m1['disk_used']}%)"
+        )
+        time.sleep(15)
+
+        m2 = get_metrics(inst)
+        if m2 is None:
+            send_message(inst['chat_id'], f"🔴 *{inst['name']}* is *unreachable!*\n🕐 `{timestamp}`")
+            continue
+
         alerts = []
-        if m['cpu'] >= CPU_ALERT_THRESHOLD:
-            alerts.append(f"🔴 HIGH CPU: `{m['cpu']}%`")
-        if m['mem_used'] >= MEMORY_ALERT_THRESHOLD:
-            alerts.append(f"🔴 HIGH MEMORY: `{m['mem_used']}%`")
-        if m['disk_used'] >= DISK_ALERT_THRESHOLD:
-            alerts.append(f"🔴 HIGH DISK: `{m['disk_used']}%`")
+
+        cpu_avg = round((m1['cpu'] + m2['cpu']) / 2, 1)
+        if m1['cpu'] >= CPU_ALERT_THRESHOLD and m2['cpu'] >= CPU_ALERT_THRESHOLD:
+            alerts.append(f"🔴 HIGH CPU: `{cpu_avg}%` (sustained over 15s)")
+
+        mem_avg = round((m1['mem_used'] + m2['mem_used']) / 2, 1)
+        if m1['mem_used'] >= MEMORY_ALERT_THRESHOLD and m2['mem_used'] >= MEMORY_ALERT_THRESHOLD:
+            alerts.append(f"🔴 HIGH MEMORY: `{mem_avg}%` (sustained over 15s)")
+
+        disk_avg = round((m1['disk_used'] + m2['disk_used']) / 2, 1)
+        if m1['disk_used'] >= DISK_ALERT_THRESHOLD and m2['disk_used'] >= DISK_ALERT_THRESHOLD:
+            alerts.append(f"🔴 HIGH DISK: `{disk_avg}%` (sustained over 15s)")
+
         if alerts:
             msg = (
                 f"⚠ *ALERT — {inst['name']}*\n"
@@ -736,6 +770,9 @@ def check_all_alerts():
             ) + "\n".join(alerts)
             send_message(inst['chat_id'], msg)
             print(f"[{timestamp}] Alert sent to {inst['name']} group.")
+        else:
+            print(f"[{timestamp}] {inst['name']} spike was transient, no alert sent.")
+
 
 
 def log_all_metrics():
