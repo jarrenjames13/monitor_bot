@@ -207,10 +207,16 @@ def build_prompt(findings: dict) -> str:
 # ─── BEDROCK CALLER ───────────────────────────────────────
 
 def _get_session():
+    access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    
+    if not access_key or not secret_key:
+        raise ValueError("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set in .env")
+    
     return aioboto3.Session(
         region_name=os.getenv("AWS_REGION", "us-west-2"),
-        aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
     )
 
 
