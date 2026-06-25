@@ -25,8 +25,9 @@ import os
 import traceback
 
 import aioboto3
+from dotenv import load_dotenv
 
-load_dotenv = os.getenv("LOAD_DOTENV", "true").lower() == "true"
+load_dotenv()
 
 MODEL_ID = os.getenv("BEDROCK_MODEL_ID", "us.meta.llama3-3-70b-instruct-v1:0")
 
