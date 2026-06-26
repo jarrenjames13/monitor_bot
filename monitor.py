@@ -881,7 +881,7 @@ def run_nightly_security_analysis():
 # schedule.every(REPORT_INTERVAL).minutes.do(send_scheduled_reports)
 schedule.every(1).minutes.do(check_all_alerts)
 schedule.every(5).minutes.do(log_all_metrics)
-schedule.every().day.at("23:00").do(run_nightly_security_analysis)   # ← 11 PM PHT
+schedule.every().day.at("15:00").do(run_nightly_security_analysis)   # ← 11 PM PHT
 
 # Command listener thread
 thread = threading.Thread(target=handle_commands, daemon=True)
