@@ -114,7 +114,7 @@ def _scan_network_local(f: dict):
     suspicious_conns = []
 
     # Well-known safe ports — extend as needed
-    safe_listening = {22, 80, 443, 8080, 8443, 3306, 5432, 6379, 27017}
+    safe_listening = {22, 80, 443, 5001, 8080, 8443, 3306, 5432, 6379, 27017}
 
     for conn in psutil.net_connections(kind="inet"):
         try:
@@ -222,7 +222,7 @@ findings = {
 
 SUSP_NAMES = {'nc','netcat','ncat','nmap','masscan','socat','xmrig','cgminer','minerd','ethminer','msfconsole','hydra','sqlmap','john','hashcat'}
 SUSP_PATHS = ['/tmp/','/dev/shm/','/var/tmp/','/run/shm/']
-SAFE_PORTS  = {22,80,443,8080,8443,3306,5432,6379,27017}
+SAFE_PORTS  = {22,80,443,5001,8080,8443,3306,5432,6379,27017}
 
 def is_private(ip):
     parts = ip.split('.')
