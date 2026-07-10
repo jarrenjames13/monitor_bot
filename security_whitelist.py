@@ -46,9 +46,30 @@ SAFE_ADMIN_USERS = {
     # Add your admin usernames here
 }
 
-# ─── SAFE HOSTNAMES ──────────────────────────────────────
-# Known safe hostnames for SSH connections
-SAFE_SSH_HOSTS = {
-    "121.58.203.121",  # Your IP
-    # Add more trusted SSH source hosts here
+# ─── SAFE SSH SOURCE IPs ─────────────────────────────────
+# Known safe IPs for SSH connections (your workstation, office, etc.)
+SAFE_SSH_SOURCES = {
+    "121.58.203.121",  # Your current SSH IP
+    # Add more trusted SSH source IPs here
 }
+
+# ─── KNOWN LEGITIMATE SERVICES ───────────────────────────
+# Services/domains that legitimately make outbound HTTPS connections
+# Examples: AWS services, package managers, Docker Hub, GitHub, etc.
+LEGITIMATE_OUTBOUND_PATTERNS = {
+    "package_updates",     # apt, yum, dnf
+    "docker",              # Docker Hub
+    "aws_services",        # AWS API calls
+    "github",              # Git operations
+    "cloudflare",          # CDN
+    "letsencrypt",         # SSL certificate renewal
+}
+
+# ─── HTTPS OUTBOUND CONNECTION POLICY ────────────────────
+# By default, don't flag HTTPS (443) outbound connections as highly suspicious
+# unless there are OTHER red flags (suspicious processes, high volumes, etc.)
+ALLOW_NORMAL_HTTPS_OUTBOUND = True
+
+# Maximum number of concurrent HTTPS connections before flagging as suspicious
+# Normal servers might have 5-20 connections for updates, APIs, etc.
+MAX_NORMAL_HTTPS_CONNECTIONS = 30

@@ -18,7 +18,8 @@ import psutil
 try:
     from security_whitelist import (
         SAFE_EXTERNAL_IPS, SAFE_PORTS, SAFE_LOCALHOST_ADDRS,
-        SAFE_ADMIN_USERS, SAFE_SSH_HOSTS
+        SAFE_ADMIN_USERS, SAFE_SSH_SOURCES,
+        ALLOW_NORMAL_HTTPS_OUTBOUND, MAX_NORMAL_HTTPS_CONNECTIONS
     )
 except ImportError:
     # Fallback if whitelist file doesn't exist
@@ -26,7 +27,9 @@ except ImportError:
     SAFE_PORTS = {22, 53, 80, 443, 5001, 3306, 5432, 6379, 8080, 8443, 27017}
     SAFE_LOCALHOST_ADDRS = {"127.0.0.53", "127.0.0.54"}
     SAFE_ADMIN_USERS = {"ubuntu", "admin"}
-    SAFE_SSH_HOSTS = {"121.58.203.121"}
+    SAFE_SSH_SOURCES = {"121.58.203.121"}
+    ALLOW_NORMAL_HTTPS_OUTBOUND = True
+    MAX_NORMAL_HTTPS_CONNECTIONS = 30
 
 # ─── KNOWN-SAFE BASELINES ─────────────────────────────────
 # Extend these lists to match your normal environment.

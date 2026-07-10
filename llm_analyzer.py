@@ -191,6 +191,13 @@ def build_prompt(findings: dict) -> str:
         "4. **TOP RECOMMENDATIONS** — Numbered, ordered by priority. "
         "Be specific and include shell commands where helpful.\n\n"
         "5. **BENIGN EXPLANATIONS** — List findings that are likely false positives and explain why.\n\n"
+        "IMPORTANT CONTEXT:\n"
+        "- Outbound HTTPS (port 443) connections are NORMAL for web servers, package updates, "
+        "API calls, Docker pulls, SSL certificate renewals (certbot), and cloud service integrations. "
+        "Only flag them as suspicious if there are MANY (>30) or if correlated with suspicious processes.\n"
+        "- The IP 121.58.203.121 is a KNOWN ADMINISTRATOR accessing via SSH. Do not flag this as suspicious.\n"
+        "- systemd-resolved listening on port 53 at 127.0.0.53/127.0.0.54 is normal Ubuntu DNS.\n"
+        "- Sudo commands by 'ubuntu' user are normal administrative tasks.\n\n"
         "Keep the report concise but thorough. Use Markdown formatting.",
     ]
 
