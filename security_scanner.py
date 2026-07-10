@@ -14,6 +14,20 @@ from datetime import datetime
 
 import psutil
 
+# Import whitelists
+try:
+    from security_whitelist import (
+        SAFE_EXTERNAL_IPS, SAFE_PORTS, SAFE_LOCALHOST_ADDRS,
+        SAFE_ADMIN_USERS, SAFE_SSH_HOSTS
+    )
+except ImportError:
+    # Fallback if whitelist file doesn't exist
+    SAFE_EXTERNAL_IPS = {"121.58.203.121"}
+    SAFE_PORTS = {22, 53, 80, 443, 5001, 3306, 5432, 6379, 8080, 8443, 27017}
+    SAFE_LOCALHOST_ADDRS = {"127.0.0.53", "127.0.0.54"}
+    SAFE_ADMIN_USERS = {"ubuntu", "admin"}
+    SAFE_SSH_HOSTS = {"121.58.203.121"}
+
 # ─── KNOWN-SAFE BASELINES ─────────────────────────────────
 # Extend these lists to match your normal environment.
 KNOWN_SERVICES = {
@@ -113,12 +127,6 @@ def _scan_network_local(f: dict):
     established = []
     suspicious_conns = []
 
-    # Well-known safe ports — extend as needed
-    safe_listening = {22, 53, 80, 443, 5001, 8080, 8443, 3306, 5432, 6379, 27017}
-    
-    # Safe localhost addresses (systemd-resolved DNS)
-    safe_localhost_addrs = {"127.0.0.53", "127.0.0.54"}
-
     for conn in psutil.net_connections(kind="inet"):
         try:
             laddr = conn.laddr
@@ -130,16 +138,16 @@ def _scan_network_local(f: dict):
                 addr_ip = laddr.ip if laddr else ""
                 
                 # Skip if it's a safe port or systemd-resolved on localhost
-                if port and port not in safe_listening:
+                if port and port not in SAFE_PORTS:
                     # Allow port 53 on localhost (systemd-resolved)
-                    if port == 53 and addr_ip in safe_localhost_addrs:
+                    if port == 53 and addr_ip in SAFE_LOCALHOST_ADDRS:
                         continue
                     listening.append({"port": port, "addr": str(laddr)})
 
             elif status == "ESTABLISHED" and raddr:
                 rip = raddr.ip
-                # Flag non-RFC1918 outbound connections (public IPs)
-                if not _is_private_ip(rip):
+                # Skip known safe external IPs and private IPs
+                if rip not in SAFE_EXTERNAL_IPS and not _is_private_ip(rip):
                     established.append({
                         "local":  str(laddr),
                         "remote": str(raddr),
@@ -231,7 +239,8 @@ findings = {
 
 SUSP_NAMES = {'nc','netcat','ncat','nmap','masscan','socat','xmrig','cgminer','minerd','ethminer','msfconsole','hydra','sqlmap','john','hashcat'}
 SUSP_PATHS = ['/tmp/','/dev/shm/','/var/tmp/','/run/shm/']
-SAFE_PORTS  = {22,80,443,5001,8080,8443,3306,5432,6379,27017}
+SAFE_PORTS  = {22,53,80,443,5001,8080,8443,3306,5432,6379,27017}
+SAFE_LOCALHOST = {'127.0.0.53','127.0.0.54'}
 
 def is_private(ip):
     parts = ip.split('.')
@@ -263,7 +272,12 @@ for p in psutil.process_iter(['pid','name','exe','username','cpu_percent','memor
 for c in psutil.net_connections(kind='inet'):
     try:
         la=c.laddr; ra=c.raddr; st=c.status
-        if st=='LISTEN' and la and la.port not in SAFE_PORTS: findings['network']['unexpected_listening'].append({'port':la.port,'addr':str(la)})
+        if st=='LISTEN' and la:
+            # Skip systemd-resolved on localhost
+            if la.port == 53 and la.ip in SAFE_LOCALHOST:
+                continue
+            if la.port not in SAFE_PORTS:
+                findings['network']['unexpected_listening'].append({'port':la.port,'addr':str(la)})
         elif st=='ESTABLISHED' and ra and not is_private(ra.ip): findings['network']['external_connections'].append({'local':str(la),'remote':str(ra)})
     except: pass
 findings['network']['external_connections'] = findings['network']['external_connections'][:20]
