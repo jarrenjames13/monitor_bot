@@ -19,17 +19,23 @@ try:
     from security_whitelist import (
         SAFE_EXTERNAL_IPS, SAFE_PORTS, SAFE_LOCALHOST_ADDRS,
         SAFE_ADMIN_USERS, SAFE_SSH_SOURCES,
-        ALLOW_NORMAL_HTTPS_OUTBOUND, MAX_NORMAL_HTTPS_CONNECTIONS
+        ALLOW_NORMAL_HTTPS_OUTBOUND, MAX_NORMAL_HTTPS_CONNECTIONS,
+        SAFE_PROCESS_NAMES, SAFE_ZOMBIE_PATTERNS,
+        EPHEMERAL_PORT_MIN, EPHEMERAL_PORT_MAX
     )
 except ImportError:
     # Fallback if whitelist file doesn't exist
     SAFE_EXTERNAL_IPS = {"121.58.203.121"}
-    SAFE_PORTS = {22, 53, 80, 443, 5001, 3306, 5432, 6379, 8080, 8443, 27017}
+    SAFE_PORTS = {22, 53, 80, 443, 5001, 3306, 33060, 5432, 6379, 8080, 8443, 27017}
     SAFE_LOCALHOST_ADDRS = {"127.0.0.53", "127.0.0.54"}
     SAFE_ADMIN_USERS = {"ubuntu", "admin"}
     SAFE_SSH_SOURCES = {"121.58.203.121"}
     ALLOW_NORMAL_HTTPS_OUTBOUND = True
     MAX_NORMAL_HTTPS_CONNECTIONS = 30
+    SAFE_PROCESS_NAMES = {"chrome", "chrome-headless", "python", "python3", "node"}
+    SAFE_ZOMBIE_PATTERNS = {"chrome", "chromium", "node", "python"}
+    EPHEMERAL_PORT_MIN = 32768
+    EPHEMERAL_PORT_MAX = 65535
 
 # ─── KNOWN-SAFE BASELINES ─────────────────────────────────
 # Extend these lists to match your normal environment.
@@ -97,9 +103,12 @@ def _scan_processes_local(f: dict):
             user   = info.get("username") or ""
             pid    = info.get("pid")
 
-            # Zombie check
+            # Zombie check - filter out known safe zombie processes
             if status == psutil.STATUS_ZOMBIE:
-                zombies.append({"pid": pid, "name": name})
+                # Check if this is from a known safe application
+                is_safe_zombie = any(pattern in name.lower() for pattern in SAFE_ZOMBIE_PATTERNS)
+                if not is_safe_zombie:
+                    zombies.append({"pid": pid, "name": name})
 
             # High resource usage
             if cpu >= CPU_SPIKE_THRESHOLD:
@@ -140,10 +149,13 @@ def _scan_network_local(f: dict):
                 port = laddr.port if laddr else None
                 addr_ip = laddr.ip if laddr else ""
                 
-                # Skip if it's a safe port or systemd-resolved on localhost
+                # Skip safe ports, ephemeral ports, and systemd-resolved on localhost
                 if port and port not in SAFE_PORTS:
                     # Allow port 53 on localhost (systemd-resolved)
                     if port == 53 and addr_ip in SAFE_LOCALHOST_ADDRS:
+                        continue
+                    # Skip ephemeral ports (high-numbered temporary ports)
+                    if EPHEMERAL_PORT_MIN <= port <= EPHEMERAL_PORT_MAX:
                         continue
                     listening.append({"port": port, "addr": str(laddr)})
 
@@ -242,8 +254,11 @@ findings = {
 
 SUSP_NAMES = {'nc','netcat','ncat','nmap','masscan','socat','xmrig','cgminer','minerd','ethminer','msfconsole','hydra','sqlmap','john','hashcat'}
 SUSP_PATHS = ['/tmp/','/dev/shm/','/var/tmp/','/run/shm/']
-SAFE_PORTS  = {22,53,80,443,5001,8080,8443,3306,5432,6379,27017}
+SAFE_PORTS  = {22,53,80,443,5001,8080,8443,3306,33060,5432,6379,27017}
 SAFE_LOCALHOST = {'127.0.0.53','127.0.0.54'}
+SAFE_ZOMBIES = {'chrome','chromium','node','python'}
+EPHEMERAL_MIN = 32768
+EPHEMERAL_MAX = 65535
 
 def is_private(ip):
     parts = ip.split('.')
@@ -264,7 +279,10 @@ for p in psutil.process_iter(['pid','name','exe','username','cpu_percent','memor
     try:
         i = p.info
         name=i.get('name',''); exe=i.get('exe','') or ''; cpu=i.get('cpu_percent') or 0; mem=i.get('memory_percent') or 0; status=i.get('status',''); user=i.get('username','')
-        if status == 'zombie': findings['processes']['zombies'].append({'pid':i['pid'],'name':name})
+        # Filter out safe zombie processes
+        if status == 'zombie':
+            if not any(z in name.lower() for z in SAFE_ZOMBIES):
+                findings['processes']['zombies'].append({'pid':i['pid'],'name':name})
         if cpu >= 50: findings['processes']['high_cpu'].append({'pid':i['pid'],'name':name,'cpu':round(cpu,1),'user':user,'exe':exe})
         if mem >= 30: findings['processes']['high_mem'].append({'pid':i['pid'],'name':name,'mem':round(mem,1),'user':user,'exe':exe})
         if name.lower() in SUSP_NAMES: findings['processes']['suspicious_name'].append({'pid':i['pid'],'name':name,'exe':exe,'user':user})
@@ -276,11 +294,14 @@ for c in psutil.net_connections(kind='inet'):
     try:
         la=c.laddr; ra=c.raddr; st=c.status
         if st=='LISTEN' and la:
-            # Skip systemd-resolved on localhost
+            # Skip systemd-resolved on localhost, safe ports, and ephemeral ports
             if la.port == 53 and la.ip in SAFE_LOCALHOST:
                 continue
-            if la.port not in SAFE_PORTS:
-                findings['network']['unexpected_listening'].append({'port':la.port,'addr':str(la)})
+            if la.port in SAFE_PORTS:
+                continue
+            if EPHEMERAL_MIN <= la.port <= EPHEMERAL_MAX:
+                continue
+            findings['network']['unexpected_listening'].append({'port':la.port,'addr':str(la)})
         elif st=='ESTABLISHED' and ra and not is_private(ra.ip): findings['network']['external_connections'].append({'local':str(la),'remote':str(ra)})
     except: pass
 findings['network']['external_connections'] = findings['network']['external_connections'][:20]

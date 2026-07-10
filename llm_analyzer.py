@@ -197,7 +197,11 @@ def build_prompt(findings: dict) -> str:
         "Only flag them as suspicious if there are MANY (>30) or if correlated with suspicious processes.\n"
         "- The IP 121.58.203.121 is a KNOWN ADMINISTRATOR accessing via SSH. Do not flag this as suspicious.\n"
         "- systemd-resolved listening on port 53 at 127.0.0.53/127.0.0.54 is normal Ubuntu DNS.\n"
-        "- Sudo commands by 'ubuntu' user are normal administrative tasks.\n\n"
+        "- Sudo commands by 'ubuntu' user are normal administrative tasks.\n"
+        "- Port 33060 is MySQL X Protocol (modern MySQL), not suspicious.\n"
+        "- Ephemeral ports (32768-65535) are temporary OS-assigned ports, not suspicious.\n"
+        "- Zombie processes from chrome/chromium are normal for headless browsers (Puppeteer/Selenium).\n"
+        "- Python/Node.js processes with high CPU may be legitimate application workloads.\n\n"
         "Keep the report concise but thorough. Use Markdown formatting.",
     ]
 
