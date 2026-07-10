@@ -256,28 +256,124 @@ async def analyze_with_bedrock(findings: dict) -> str:
 def format_telegram_report(inst_name: str, llm_output: str, timestamp: str) -> list[str]:
     """
     Telegram messages are limited to 4096 chars.
-    Split the LLM output into chunks and prepend a header.
+    Format the LLM output for better readability in Telegram and split into chunks.
     Returns a list of message strings ready to send.
     """
+    # Clean up and format the LLM output for Telegram
+    formatted = _format_for_telegram(llm_output)
+    
     header = (
-        f"🔐 *Security Intelligence Report — {inst_name}*\n"
-        f"🕐 `{timestamp}`\n"
-        f"{'─' * 36}\n\n"
+        f"🔐 *Security Report*\n"
+        f"🖥️ Instance: `{inst_name}`\n"
+        f"🕐 {timestamp}\n"
+        f"{'─' * 38}\n\n"
     )
 
-    full_text = header + llm_output
+    full_text = header + formatted
     chunks    = []
     limit     = 4000  # leave headroom for Markdown escaping
 
     while len(full_text) > limit:
-        # Try to split on a newline near the limit
-        split_at = full_text.rfind("\n", 0, limit)
+        # Try to split on section boundaries first (###), then paragraphs, then any newline
+        split_at = full_text.rfind("\n### ", 0, limit)
+        if split_at == -1:
+            split_at = full_text.rfind("\n\n", 0, limit)
+        if split_at == -1:
+            split_at = full_text.rfind("\n", 0, limit)
         if split_at == -1:
             split_at = limit
-        chunks.append(full_text[:split_at])
+            
+        chunk = full_text[:split_at].rstrip()
+        chunks.append(chunk)
         full_text = full_text[split_at:].lstrip("\n")
 
     if full_text:
-        chunks.append(full_text)
+        chunks.append(full_text.rstrip())
 
     return chunks
+
+
+def _format_for_telegram(text: str) -> str:
+    """
+    Format markdown text for better Telegram readability.
+    - Converts section headers to more compact format
+    - Adds appropriate emojis for visual scanning
+    - Formats bullet points and numbered lists
+    - Preserves code blocks and emphasis
+    """
+    lines = text.split('\n')
+    formatted_lines = []
+    
+    for line in lines:
+        # Skip empty lines at the start
+        if not formatted_lines and not line.strip():
+            continue
+            
+        # Format main section headers (## or ###)
+        if line.startswith('### '):
+            section_title = line.replace('### ', '').strip()
+            emoji = _get_section_emoji(section_title)
+            formatted_lines.append(f"\n{emoji} *{section_title.upper()}*")
+            continue
+        elif line.startswith('## '):
+            section_title = line.replace('## ', '').strip()
+            emoji = _get_section_emoji(section_title)
+            formatted_lines.append(f"\n{emoji} *{section_title.upper()}*")
+            continue
+        elif line.startswith('# '):
+            section_title = line.replace('# ', '').strip()
+            emoji = _get_section_emoji(section_title)
+            formatted_lines.append(f"\n{emoji} *{section_title.upper()}*")
+            continue
+            
+        # Format numbered lists (recommendations)
+        if line.strip() and line.strip()[0].isdigit() and '. ' in line[:5]:
+            formatted_lines.append(line)
+            continue
+            
+        # Format bullet points
+        if line.strip().startswith('- '):
+            formatted_lines.append(line.replace('- ', '  • ', 1))
+            continue
+        elif line.strip().startswith('* '):
+            formatted_lines.append(line.replace('* ', '  • ', 1))
+            continue
+            
+        # Preserve other lines
+        formatted_lines.append(line)
+    
+    result = '\n'.join(formatted_lines)
+    
+    # Clean up excessive newlines (more than 2 in a row)
+    while '\n\n\n' in result:
+        result = result.replace('\n\n\n', '\n\n')
+    
+    return result.strip()
+
+
+def _get_section_emoji(section_title: str) -> str:
+    """Return appropriate emoji for section title."""
+    title_lower = section_title.lower()
+    
+    if 'executive' in title_lower or 'summary' in title_lower:
+        return '📋'
+    elif 'risk' in title_lower or 'rating' in title_lower:
+        return '⚠️'
+    elif 'finding' in title_lower or 'correlation' in title_lower:
+        return '🔍'
+    elif 'recommendation' in title_lower or 'action' in title_lower:
+        return '💡'
+    elif 'benign' in title_lower or 'false' in title_lower or 'explanation' in title_lower:
+        return '✅'
+    elif 'network' in title_lower:
+        return '🌐'
+    elif 'process' in title_lower:
+        return '⚙️'
+    elif 'user' in title_lower or 'auth' in title_lower:
+        return '👤'
+    elif 'file' in title_lower:
+        return '📁'
+    elif 'service' in title_lower or 'cron' in title_lower:
+        return '🔧'
+    else:
+        return '▪️'

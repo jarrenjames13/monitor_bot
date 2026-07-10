@@ -114,7 +114,10 @@ def _scan_network_local(f: dict):
     suspicious_conns = []
 
     # Well-known safe ports — extend as needed
-    safe_listening = {22, 80, 443, 5001, 8080, 8443, 3306, 5432, 6379, 27017}
+    safe_listening = {22, 53, 80, 443, 5001, 8080, 8443, 3306, 5432, 6379, 27017}
+    
+    # Safe localhost addresses (systemd-resolved DNS)
+    safe_localhost_addrs = {"127.0.0.53", "127.0.0.54"}
 
     for conn in psutil.net_connections(kind="inet"):
         try:
@@ -124,7 +127,13 @@ def _scan_network_local(f: dict):
 
             if status == "LISTEN":
                 port = laddr.port if laddr else None
+                addr_ip = laddr.ip if laddr else ""
+                
+                # Skip if it's a safe port or systemd-resolved on localhost
                 if port and port not in safe_listening:
+                    # Allow port 53 on localhost (systemd-resolved)
+                    if port == 53 and addr_ip in safe_localhost_addrs:
+                        continue
                     listening.append({"port": port, "addr": str(laddr)})
 
             elif status == "ESTABLISHED" and raddr:
