@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import csv
+import ipaddress
 import json
 import os
 import subprocess
@@ -15,10 +17,8 @@ import schedule
 from dotenv import load_dotenv
 
 from security_scanner import collect_local, collect_remote, has_any_findings
-from llm_analyzer import analyze_with_bedrock, format_telegram_report
 
 # ─── LOAD ENV ─────────────────────────────────────────────
-load_dotenv()
 PH_TZ = ZoneInfo("Asia/Manila")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -33,75 +33,178 @@ REPORT_INTERVAL        = int(os.getenv("REPORT_INTERVAL", 30))
 
 _metrics_lock = threading.Lock()
 
-if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN must be set in .env file")
-
 # ─── INSTANCE → GROUP MAPPING ─────────────────────────────
 INSTANCES = []
-i = 1
-while True:
-    name     = os.getenv(f"INSTANCE_{i}_NAME")
-    ip       = os.getenv(f"INSTANCE_{i}_IP")
-    chat_id  = os.getenv(f"INSTANCE_{i}_CHAT_ID")
-    key      = os.getenv(f"INSTANCE_{i}_KEY", "").strip()
-    ssh_user = os.getenv(f"INSTANCE_{i}_SSH_USER", "").strip()
+CHAT_TO_INSTANCE = {}
 
-    if not name or not ip or not chat_id:
-        break
 
-    is_local = ip.strip() in ("localhost", "127.0.0.1")
+def _security_setting(environ, index, suffix, name):
+    """Return one optional per-instance security identity setting."""
+    raw = environ.get(f"INSTANCE_{index}_SECURITY_{suffix}")
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        raise ValueError(
+            f"❌ INSTANCE_{index}_SECURITY_{suffix} is set but empty for instance '{name}': "
+            "remove the setting or provide a real value"
+        )
+    return value
 
-    if not is_local:
-        if not key:
-            raise ValueError(f"❌ INSTANCE_{i}_KEY is required for remote instance '{name}'")
-        if not ssh_user:
-            raise ValueError(f"❌ INSTANCE_{i}_SSH_USER is required for remote instance '{name}'")
-        if not os.path.isfile(key):
-            raise ValueError(f"❌ Key file not found for '{name}': {key}")
 
-    is_windows = ssh_user.lower() in ("administrator", "admin") if ssh_user else False
+def _security_destinations(environ, index, suffix, name):
+    """
+    Parse a service-scoped destination list. Entries are exact addresses or CIDRs
+    with an optional :port suffix, separated by ';' or ','. Dynamic destinations
+    are resolved on every scan by comparing the observed socket address, so a
+    stale entry simply stops matching instead of silently trusting a new address.
+    """
+    raw = _security_setting(environ, index, suffix, name)
+    if raw is None:
+        return []
+    entries = [item.strip() for item in raw.replace(",", ";").split(";")]
+    if any(not item for item in entries):
+        raise ValueError(
+            f"❌ INSTANCE_{index}_SECURITY_{suffix} has an empty entry for instance "
+            f"'{name}': use one address or CIDR per ';' separated entry"
+        )
+    for item in entries:
+        address, separator, port = item.rpartition(":") if item.count(":") == 1 else (item, "", "")
+        if not separator:
+            address, port = item, ""
+        try:
+            if "/" in address:
+                ipaddress.ip_network(address, strict=False)
+            else:
+                ipaddress.ip_address(address)
+        except ValueError as exc:
+            raise ValueError(
+                f"❌ Invalid INSTANCE_{index}_SECURITY_{suffix} entry {item!r} for "
+                f"instance '{name}': expected an IP address or CIDR"
+            ) from exc
+        if port and not port.isdigit():
+            raise ValueError(
+                f"❌ Invalid INSTANCE_{index}_SECURITY_{suffix} port in entry {item!r} "
+                f"for instance '{name}': expected a numeric port"
+            )
+    return entries
 
-    INSTANCES.append({
-        "name":       name.strip(),
-        "ip":         ip.strip(),
-        "chat_id":    chat_id.strip(),
-        "key":        key if not is_local else None,
-        "ssh_user":   ssh_user if not is_local else None,
-        "is_local":   is_local,
-        "is_windows": is_windows,
-        "index":      i
-    })
-    i += 1
 
-if not INSTANCES:
-    raise ValueError("❌ No instances configured in .env file")
+def _security_config(environ, index, name):
+    """Per-instance, opt-in security identities used for network classification."""
+    return {
+        "bot_exe": _security_setting(environ, index, "BOT_EXE", name),
+        "bot_script": _security_setting(environ, index, "BOT_SCRIPT", name),
+        "bot_user": _security_setting(environ, index, "BOT_USER", name),
+        "bot_https_destinations": _security_destinations(
+            environ, index, "BOT_HTTPS_DESTINATIONS", name),
+        "tailscaled_exe": _security_setting(environ, index, "TAILSCALED_EXE", name),
+        "tailscaled_user": _security_setting(environ, index, "TAILSCALED_USER", name),
+        "tailscaled_https_destinations": _security_destinations(
+            environ, index, "TAILSCALED_HTTPS_DESTINATIONS", name),
+        "otel_container_name": _security_setting(
+            environ, index, "OTEL_CONTAINER_NAME", name),
+        "otel_image_id": _security_setting(environ, index, "OTEL_IMAGE_ID", name),
+    }
 
-CHAT_TO_INSTANCE = {inst["chat_id"]: inst for inst in INSTANCES}
 
-print(f"[CONFIG] Loaded {len(INSTANCES)} instance(s):")
-for inst in INSTANCES:
-    if inst["is_local"]:
-        mode = "local (psutil)"
-    elif inst["is_windows"]:
-        mode = f"Windows SSH | user={inst['ssh_user']} | key={inst['key']}"
-    else:
-        mode = f"Linux SSH | user={inst['ssh_user']} | key={inst['key']}"
-    print(f"  {inst['index']}. {inst['name']} ({inst['ip']}) → {mode} → chat {inst['chat_id']}")
+def load_instances(environ=None):
+    """Build the ordered host inventory from an environment mapping."""
+    environ = os.environ if environ is None else environ
+    instances = []
+    i = 1
+    while True:
+        name = environ.get(f"INSTANCE_{i}_NAME")
+        ip = environ.get(f"INSTANCE_{i}_IP")
+        chat_id = environ.get(f"INSTANCE_{i}_CHAT_ID")
+        key = environ.get(f"INSTANCE_{i}_KEY", "").strip()
+        ssh_user = environ.get(f"INSTANCE_{i}_SSH_USER", "").strip()
+
+        if not name or not ip or not chat_id:
+            break
+
+        is_local = ip.strip() in ("localhost", "127.0.0.1")
+
+        if not is_local:
+            if not key:
+                raise ValueError(f"❌ INSTANCE_{i}_KEY is required for remote instance '{name}'")
+            if not ssh_user:
+                raise ValueError(f"❌ INSTANCE_{i}_SSH_USER is required for remote instance '{name}'")
+            if not os.path.isfile(key):
+                raise ValueError(f"❌ Key file not found for '{name}': {key}")
+
+        configured_os = environ.get(f"INSTANCE_{i}_OS")
+        if configured_os is None:
+            is_windows = ssh_user.lower() in ("administrator", "admin") if ssh_user else False
+        else:
+            normalized_os = configured_os.strip().lower()
+            if normalized_os not in ("linux", "windows"):
+                raise ValueError(
+                    f"❌ Invalid INSTANCE_{i}_OS for instance '{name}': expected 'linux' or 'windows'"
+                )
+            is_windows = normalized_os == "windows"
+
+        primary_path = "C:\\" if is_windows else "/"
+        configured_paths = environ.get(f"INSTANCE_{i}_DISK_PATHS")
+        disk_paths = [primary_path]
+        seen_paths = {primary_path.casefold() if is_windows else primary_path}
+        if configured_paths is not None:
+            extra_paths = [path.strip() for path in configured_paths.split(";")]
+            if any(not path for path in extra_paths):
+                raise ValueError(
+                    f"❌ Invalid INSTANCE_{i}_DISK_PATHS for instance '{name}': entries must not be empty"
+                )
+            for path in extra_paths:
+                path_key = path.casefold() if is_windows else path
+                if path_key not in seen_paths:
+                    disk_paths.append(path)
+                    seen_paths.add(path_key)
+
+        instances.append({
+            "name":       name.strip(),
+            "ip":         ip.strip(),
+            "chat_id":    chat_id.strip(),
+            "key":        key if not is_local else None,
+            "ssh_user":   ssh_user if not is_local else None,
+            "is_local":   is_local,
+            "is_windows": is_windows,
+            "disk_paths": disk_paths,
+            "security":   _security_config(environ, i, name.strip()),
+            "index":      i
+        })
+        i += 1
+
+    if not instances:
+        raise ValueError("❌ No instances configured in .env file")
+    return instances
 
 # ─── TELEGRAM ─────────────────────────────────────────────
 
-def send_message(chat_id, text):
+def send_message(chat_id, text, context=None):
+    """
+    Deliver one Telegram message.
+
+    Returns True when Telegram accepted the message and False when the
+    transport rejected it, so a caller sending several chunks can see a
+    rejection instead of losing it. A rejected chunk never aborts the chunks
+    that follow it.
+    """
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}
+    label = f" ({context})" if context else ""
     try:
         response = requests.post(url, json=payload)
         response.raise_for_status()
+        return True
     except requests.exceptions.ConnectionError:
-        print("[ERROR] No internet connection.")
+        print(f"[ERROR] No internet connection{label}.")
+        return False
     except requests.exceptions.HTTPError as e:
-        print(f"[ERROR] HTTP error: {e}")
+        print(f"[ERROR] Telegram rejected the message{label}: {e}")
+        return False
     except Exception as e:
-        print(f"[ERROR] Unexpected error: {e}")
+        print(f"[ERROR] Unexpected error{label}: {e}")
+        return False
 
 # ─── KEY LOADER ───────────────────────────────────────────
 
@@ -158,22 +261,63 @@ def ssh_run(inst, cmd):
 
 # ─── METRICS ──────────────────────────────────────────────
 
-def get_local_metrics():
+def _disk_targets(is_windows, disk_paths=None):
+    primary_path = "C:\\" if is_windows else "/"
+    targets = [primary_path]
+    seen = {primary_path.casefold() if is_windows else primary_path}
+    for path in disk_paths or []:
+        path = str(path).strip()
+        if not path:
+            continue
+        path_key = path.casefold() if is_windows else path
+        if path_key not in seen:
+            targets.append(path)
+            seen.add(path_key)
+    return targets
+
+
+def _measure_local_disks(disk_paths):
+    results = []
+    for path in disk_paths:
+        try:
+            usage = psutil.disk_usage(path)
+            results.append({
+                "path": path,
+                "used": usage.percent,
+                "total": round(usage.total / (1024**3), 1),
+                "free": round(usage.free / (1024**3), 1),
+                "error": None,
+            })
+        except Exception as exc:
+            results.append({
+                "path": path,
+                "used": None,
+                "total": None,
+                "free": None,
+                "error": str(exc),
+            })
+    return results
+
+
+def get_local_metrics(disk_paths=None, is_windows=False):
     with _metrics_lock:
         per_core = psutil.cpu_percent(interval=3, percpu=True)
         cpu      = round(sum(per_core) / len(per_core), 1)
         memory   = psutil.virtual_memory()
-        disk     = psutil.disk_usage('/')
         net      = psutil.net_io_counters()
         boot     = datetime.fromtimestamp(psutil.boot_time(), PH_TZ)
         uptime   = now_ph() - boot
+        disks    = _measure_local_disks(_disk_targets(is_windows, disk_paths))
+        primary  = disks[0]
 
         return {
             "cpu":        cpu,
             "mem_used":   memory.percent,
             "mem_total":  round(memory.total / (1024**3), 1),
-            "disk_used":  disk.percent,
-            "disk_total": round(disk.total / (1024**3), 1),
+            "disk_used":  primary["used"],
+            "disk_total": primary["total"],
+            "disk_error": primary["error"],
+            "disks":      disks,
             "net_sent":   round(net.bytes_sent / (1024**2), 1),
             "net_recv":   round(net.bytes_recv / (1024**2), 1),
             "uptime":     str(uptime).split('.')[0],
@@ -181,33 +325,39 @@ def get_local_metrics():
         }
 
 
-def build_metrics_cmd(is_windows):
+def build_metrics_cmd(is_windows, disk_paths=None):
     python = "python" if is_windows else "python3"
-    disk   = "C:\\\\" if is_windows else "/"
-    return (
-        f"{python} -c \""
-        "import psutil, json, datetime;"
-        "per_core=psutil.cpu_percent(interval=3,percpu=True);"
-        "cpu=round(sum(per_core)/len(per_core),1);"
-        "mem=psutil.virtual_memory();"
-        f"disk=psutil.disk_usage('{disk}');"
-        "net=psutil.net_io_counters();"
-        "from zoneinfo import ZoneInfo;"
-        "tz=ZoneInfo('Asia/Manila');"
-        "boot=datetime.datetime.fromtimestamp(psutil.boot_time(), tz);"
-        "uptime=str(datetime.datetime.now(tz)-boot).split('.')[0];"
-        "print(json.dumps({"
-        "'cpu':cpu,"
-        "'mem_used':mem.percent,"
-        "'mem_total':round(mem.total/(1024**3),1),"
-        "'disk_used':disk.percent,"
-        "'disk_total':round(disk.total/(1024**3),1),"
-        "'net_sent':round(net.bytes_sent/(1024**2),1),"
-        "'net_recv':round(net.bytes_recv/(1024**2),1),"
-        "'uptime':uptime,"
-        "'per_core':per_core"
-        "}))\""
-    )
+    targets = _disk_targets(is_windows, disk_paths)
+    targets_b64 = base64.b64encode(json.dumps(targets).encode("utf-8")).decode("ascii")
+    script = f'''import base64, datetime, json, psutil
+targets = json.loads(base64.b64decode("{targets_b64}").decode("utf-8"))
+per_core = psutil.cpu_percent(interval=3, percpu=True)
+cpu = round(sum(per_core) / len(per_core), 1)
+mem = psutil.virtual_memory()
+net = psutil.net_io_counters()
+tz = datetime.timezone(datetime.timedelta(hours=8))
+boot = datetime.datetime.fromtimestamp(psutil.boot_time(), tz)
+uptime = str(datetime.datetime.now(tz) - boot).split(".")[0]
+disks = []
+for path in targets:
+    try:
+        usage = psutil.disk_usage(path)
+        disks.append({{"path": path, "used": usage.percent,
+                      "total": round(usage.total / (1024**3), 1),
+                      "free": round(usage.free / (1024**3), 1), "error": None}})
+    except Exception as exc:
+        disks.append({{"path": path, "used": None, "total": None,
+                      "free": None, "error": str(exc)}})
+primary = disks[0]
+print(json.dumps({{"cpu": cpu, "mem_used": mem.percent,
+    "mem_total": round(mem.total / (1024**3), 1),
+    "disk_used": primary["used"], "disk_total": primary["total"],
+    "disk_error": primary["error"], "disks": disks,
+    "net_sent": round(net.bytes_sent / (1024**2), 1),
+    "net_recv": round(net.bytes_recv / (1024**2), 1),
+    "uptime": uptime, "per_core": per_core}}))'''
+    script_b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    return f"{python} -c \"exec(__import__('base64').b64decode('{script_b64}'))\""
 
 
 def build_processes_cmd(is_windows):
@@ -225,7 +375,7 @@ def build_processes_cmd(is_windows):
 
 
 def get_remote_metrics(inst):
-    cmd    = build_metrics_cmd(inst["is_windows"])
+    cmd    = build_metrics_cmd(inst["is_windows"], inst.get("disk_paths"))
     output = ssh_run(inst, cmd)
     if output is None:
         return None
@@ -238,8 +388,54 @@ def get_remote_metrics(inst):
 
 def get_metrics(inst):
     if inst["is_local"]:
-        return get_local_metrics()
+        return get_local_metrics(inst.get("disk_paths"), inst.get("is_windows", False))
     return get_remote_metrics(inst)
+
+
+def _metrics_disks(metrics, inst=None):
+    disks = metrics.get("disks")
+    if disks is not None:
+        return disks
+    is_windows = bool(inst and inst.get("is_windows"))
+    path = "C:\\" if is_windows else "/"
+    used = metrics.get("disk_used")
+    total = metrics.get("disk_total")
+    free = round(total * (100 - used) / 100, 1) if used is not None and total is not None else None
+    return [{
+        "path": path,
+        "used": used,
+        "total": total,
+        "free": free,
+        "error": metrics.get("disk_error"),
+    }]
+
+
+def _format_disk_result(disk):
+    path = str(disk.get("path", "unknown")).replace("`", "'")[:120]
+    used = disk.get("used")
+    total = disk.get("total")
+    free = disk.get("free")
+    error = str(disk.get("error") or "unavailable").replace("`", "'")[:140]
+    if used is None or total is None or free is None:
+        return f"• `{path}`: unavailable ({error})"
+    return f"• `{path}`: `{used}%` used | `{free} GB` free of `{total} GB`"
+
+
+def send_disk_message(chat_id, intro, metrics, disk_title="Disk paths", inst=None):
+    """Send every path result while keeping each Telegram message below its limit."""
+    lines = [_format_disk_result(disk) for disk in _metrics_disks(metrics, inst)]
+    if not lines:
+        lines = ["• No disk targets were returned."]
+    prefix = f"{intro}\n\n💿 *{disk_title}:*\n"
+    continuation = f"💿 *{disk_title} (continued):*\n"
+    message = prefix
+    for line in lines:
+        addition = f"{line}\n"
+        if len(message) + len(addition) > 3500 and message != prefix:
+            send_message(chat_id, message.rstrip())
+            message = continuation
+        message += addition
+    send_message(chat_id, message.rstrip())
 
 
 def get_processes(inst):
@@ -316,9 +512,9 @@ def cmd_status(chat_id, inst):
     msg = (
         f"🖥 *{inst['name']} — Quick Status*\n"
         f"🕐 `{timestamp}`\n\n"
-        f"CPU: `{m['cpu']}%` | RAM: `{m['mem_used']}%` | Disk: `{m['disk_used']}%`"
+        f"CPU: `{m['cpu']}%` | RAM: `{m['mem_used']}%`"
     )
-    send_message(chat_id, msg)
+    send_disk_message(chat_id, msg, m, "Disk paths", inst)
 
 
 def cmd_report(chat_id, inst):
@@ -332,12 +528,11 @@ def cmd_report(chat_id, inst):
         f"🕐 `{timestamp}`\n\n"
         f"🖥 *CPU:*    `{m['cpu']}%`\n"
         f"💾 *Memory:* `{m['mem_used']}%` of `{m['mem_total']} GB`\n"
-        f"💿 *Disk:*   `{m['disk_used']}%` of `{m['disk_total']} GB`\n"
         f"📤 *Sent:*   `{m['net_sent']} MB`\n"
         f"📥 *Recv:*   `{m['net_recv']} MB`\n"
         f"⏱ *Uptime:* `{m['uptime']}`"
     )
-    send_message(chat_id, msg)
+    send_disk_message(chat_id, msg, m, "Disk paths", inst)
 
 
 def cmd_cpu(chat_id, inst):
@@ -373,15 +568,8 @@ def cmd_disk(chat_id, inst):
     if m is None:
         send_message(chat_id, f"❌ *{inst['name']}* is unreachable.")
         return
-    drive = "C:\\" if inst["is_windows"] else "/"
-    msg = (
-        f"💿 *{inst['name']} — Disk Details*\n\n"
-        f"  Drive: `{drive}`\n"
-        f"  Used:  `{round(m['disk_used'] * m['disk_total'] / 100, 1)} GB` (`{m['disk_used']}%`)\n"
-        f"  Free:  `{round((100 - m['disk_used']) * m['disk_total'] / 100, 1)} GB`\n"
-        f"  Total: `{m['disk_total']} GB`"
-    )
-    send_message(chat_id, msg)
+    intro = f"💿 *{inst['name']} — Disk Details*"
+    send_disk_message(chat_id, intro, m, "Disk paths", inst)
 
 
 def cmd_network(chat_id, inst):
@@ -485,11 +673,13 @@ def cmd_history(chat_id, inst):
         last5 = filtered[-5:]
         lines = []
         for row in last5:
+            disk_used = row.get('disk_used')
+            disk_text = f"{disk_used}%" if disk_used not in (None, "") else "Unavailable"
             lines.append(
                 f"🕐 `{row['timestamp']}`\n"
-                f"  CPU: `{row['cpu']}%` | RAM: `{row['mem_used']}%` | Disk: `{row['disk_used']}%`"
+                f"  CPU: `{row['cpu']}%` | RAM: `{row['mem_used']}%` | Primary disk: `{disk_text}`"
             )
-        msg = f"📜 *{inst['name']} — Last 5 Entries*\n\n" + "\n\n".join(lines)
+        msg = f"📜 *{inst['name']} — Last 5 Entries (primary disk only)*\n\n" + "\n\n".join(lines)
         send_message(chat_id, msg)
     except Exception as e:
         send_message(chat_id, f"❌ Could not read log: {e}")
@@ -600,68 +790,89 @@ def cmd_logs(chat_id, inst):
 
 # ─── SECURITY COMMAND ─────────────────────────────────────
 
+def _collect_security_findings(inst):
+    """Scan one instance with its configured security identities."""
+    if inst["is_local"]:
+        return collect_local(inst["name"], inst.get("security"))
+    return collect_remote(inst, ssh_run, inst.get("security"))
+
+
+def send_security_assessment(chat_id, inst, findings, timestamp):
+    """Deliver the authoritative deterministic assessment for one scan."""
+    from llm_analyzer import format_assessment
+
+    rejected = _deliver_chunks(chat_id, inst, format_assessment(findings, timestamp),
+                               "assessment")
+    if rejected:
+        print(f"[ERROR] {rejected} authoritative assessment chunk(s) were rejected by "
+              f"Telegram for {inst['name']}; that part of the report was NOT delivered.")
+
+
+def send_security_advisory(chat_id, inst, timestamp, llm_output=None, llm_error=None):
+    """
+    Deliver the AI commentary, clearly marked advisory, after the assessment.
+
+    A failed, missing, or error-string response never removes or lowers the
+    authoritative assessment that was already delivered.
+    """
+    if llm_error is not None:
+        send_message(
+            chat_id,
+            f"❌ AI analysis unavailable for *{inst['name']}*: `{str(llm_error)[:200]}`\n"
+            "The deterministic assessment above is complete and unaffected.",
+        )
+        return
+    if llm_output is None:
+        return
+    from llm_analyzer import format_advisory
+
+    rejected = _deliver_chunks(
+        chat_id, inst, format_advisory(inst["name"], llm_output, timestamp), "advisory")
+    if rejected:
+        print(f"[ERROR] {rejected} advisory chunk(s) were rejected by Telegram for "
+              f"{inst['name']}; the authoritative assessment above is unaffected.")
+
+
+def _deliver_chunks(chat_id, inst, chunks, label):
+    """Send every chunk, count the rejections, and never stop on one failure."""
+    rejected = 0
+    for index, chunk in enumerate(chunks, start=1):
+        if not send_message(chat_id, chunk, context=f"{label} chunk {index}"):
+            rejected += 1
+    return rejected
+
+
+def _call_security_model(findings):
+    """Return (llm_output, llm_error) without ever raising."""
+    from llm_analyzer import analyze_with_bedrock
+
+    try:
+        llm_output = asyncio.run(analyze_with_bedrock(findings))
+    except Exception as e:
+        return None, e
+    if isinstance(llm_output, str) and llm_output.startswith("❌ Bedrock analysis failed"):
+        return None, llm_output
+    return llm_output, None
+
+
 def cmd_security(chat_id, inst):
     """
-    /security — On-demand security scan + LLM analysis for this instance.
-    Gathers signals via psutil/SSH then sends to Bedrock for a full AI report.
+    /security — On-demand security scan for this instance.
+    Gathers structured evidence via psutil/SSH, sends the authoritative
+    deterministic assessment, then the advisory Bedrock commentary.
     """
     send_message(chat_id, f"🔍 *{inst['name']}* — Running security scan, please wait ~30s...")
 
     # 1. Collect findings
-    if inst["is_local"]:
-        findings = collect_local(inst["name"])
-    else:
-        findings = collect_remote(inst, ssh_run)
-
+    findings = _collect_security_findings(inst)
     timestamp = now_ph().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 2. Quick raw-signal summary while LLM thinks
-    p = findings.get("processes", {})
-    n = findings.get("network", {})
-    s = findings.get("services", {})
-    summary_lines = []
+    # 2. Authoritative assessment first, so it survives any model failure.
+    send_security_assessment(chat_id, inst, findings, timestamp)
 
-    if p.get("high_cpu"):
-        summary_lines.append(f"🔴 High-CPU processes: {len(p['high_cpu'])}")
-    if p.get("high_mem"):
-        summary_lines.append(f"🔴 High-MEM processes: {len(p['high_mem'])}")
-    if p.get("suspicious_name"):
-        summary_lines.append(f"🚨 Suspicious process names: {len(p['suspicious_name'])}")
-    if p.get("suspicious_path"):
-        summary_lines.append(f"🚨 Processes in /tmp or /dev/shm: {len(p['suspicious_path'])}")
-    if p.get("zombies"):
-        summary_lines.append(f"⚠️ Zombie processes: {len(p['zombies'])}")
-    if n.get("unexpected_listening"):
-        summary_lines.append(f"🔴 Unexpected listening ports: {len(n['unexpected_listening'])}")
-    if n.get("external_connections"):
-        summary_lines.append(f"⚠️ Active public outbound connections: {len(n['external_connections'])}")
-    if s.get("failed"):
-        summary_lines.append(f"⚠️ Failed systemd services: {len(s['failed'])}")
-    if findings.get("auth_log"):
-        summary_lines.append(f"📋 Auth log entries flagged: {len(findings['auth_log'])}")
-
-    if summary_lines:
-        summary_msg = (
-            f"📊 *Raw signals found:*\n\n"
-            + "\n".join(summary_lines)
-            + "\n\n⏳ Sending to AI for deep analysis..."
-        )
-    else:
-        summary_msg = "✅ No raw suspicious signals detected. Sending to AI for confirmation..."
-
-    send_message(chat_id, summary_msg)
-
-    # 3. Call Bedrock LLM
-    try:
-        llm_output = asyncio.run(analyze_with_bedrock(findings))
-    except Exception as e:
-        send_message(chat_id, f"❌ AI analysis failed: `{e}`")
-        return
-
-    # 4. Send chunked report
-    chunks = format_telegram_report(inst["name"], llm_output, timestamp)
-    for chunk in chunks:
-        send_message(chat_id, chunk)
+    # 3. Advisory AI commentary
+    llm_output, llm_error = _call_security_model(findings)
+    send_security_advisory(chat_id, inst, timestamp, llm_output, llm_error)
 
 
 # ─── COMMAND ROUTER ───────────────────────────────────────
@@ -739,12 +950,11 @@ def send_scheduled_reports():
             f"🕐 `{timestamp}`\n\n"
             f"🖥 *CPU:*    `{m['cpu']}%`\n"
             f"💾 *Memory:* `{m['mem_used']}%` of `{m['mem_total']} GB`\n"
-            f"💿 *Disk:*   `{m['disk_used']}%` of `{m['disk_total']} GB`\n"
             f"📤 *Sent:*   `{m['net_sent']} MB`\n"
             f"📥 *Recv:*   `{m['net_recv']} MB`\n"
             f"⏱ *Uptime:* `{m['uptime']}`"
         )
-        send_message(inst['chat_id'], msg)
+        send_disk_message(inst['chat_id'], msg, m, "Disk paths", inst)
     print(f"[{timestamp}] Scheduled reports sent.")
 
 
@@ -759,10 +969,15 @@ def _check_all_alerts_worker():
             send_message(inst['chat_id'], f"🔴 *{inst['name']}* is *unreachable!*\n🕐 `{timestamp}`")
             continue
 
+        first_disks = {disk["path"]: disk for disk in _metrics_disks(m1, inst)}
+        disk_needs_confirm = any(
+            disk.get("used") is None or disk.get("used") >= DISK_ALERT_THRESHOLD
+            for disk in first_disks.values()
+        )
         needs_confirm = (
-            m1['cpu']       >= CPU_ALERT_THRESHOLD or
-            m1['mem_used']  >= MEMORY_ALERT_THRESHOLD or
-            m1['disk_used'] >= DISK_ALERT_THRESHOLD
+            m1['cpu'] >= CPU_ALERT_THRESHOLD or
+            m1['mem_used'] >= MEMORY_ALERT_THRESHOLD or
+            disk_needs_confirm
         )
 
         if not needs_confirm:
@@ -785,9 +1000,31 @@ def _check_all_alerts_worker():
         if m1['mem_used'] >= MEMORY_ALERT_THRESHOLD and m2['mem_used'] >= MEMORY_ALERT_THRESHOLD:
             alerts.append(f"🔴 HIGH MEMORY: `{mem_avg}%` (sustained over 15s)")
 
-        disk_avg = round((m1['disk_used'] + m2['disk_used']) / 2, 1)
-        if m1['disk_used'] >= DISK_ALERT_THRESHOLD and m2['disk_used'] >= DISK_ALERT_THRESHOLD:
-            alerts.append(f"🔴 HIGH DISK: `{disk_avg}%` (sustained over 15s)")
+        second_disks = {disk["path"]: disk for disk in _metrics_disks(m2, inst)}
+        all_paths = list(first_disks)
+        all_paths.extend(path for path in second_disks if path not in first_disks)
+        for path in all_paths:
+            first = first_disks.get(path)
+            second = second_disks.get(path)
+            first_failed = first is None or first.get("used") is None or first.get("error")
+            second_failed = second is None or second.get("used") is None or second.get("error")
+            safe_path = str(path).replace("`", "'")[:120]
+            if first_failed or second_failed:
+                if first_failed and second_failed:
+                    state = "unavailable in both samples; disk check failed"
+                else:
+                    sample = "first" if first_failed else "second"
+                    state = f"unavailable in the {sample} sample; disk check incomplete"
+                failed_result = first if first_failed else second
+                error = (failed_result or {}).get("error") or "target result missing"
+                error = str(error).replace("`", "'")[:120]
+                alerts.append(f"⚠ DISK CHECK: `{safe_path}` {state} (`{error}`)")
+                continue
+            if first["used"] >= DISK_ALERT_THRESHOLD and second["used"] >= DISK_ALERT_THRESHOLD:
+                disk_avg = round((first["used"] + second["used"]) / 2, 1)
+                alerts.append(
+                    f"🔴 HIGH DISK: `{safe_path}` at `{disk_avg}%` (sustained over 15s)"
+                )
 
         if alerts:
             msg = (
@@ -837,7 +1074,8 @@ def log_all_metrics():
 def run_nightly_security_analysis():
     """
     Runs at 23:00 PHT every night.
-    Full security scan + Bedrock LLM report for every instance.
+    Full security scan plus the authoritative deterministic report for every
+    instance, followed by advisory Bedrock commentary.
     """
     timestamp = now_ph().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] Starting nightly security analysis for all instances...")
@@ -853,18 +1091,15 @@ def run_nightly_security_analysis():
             )
 
             # Collect
-            if inst["is_local"]:
-                findings = collect_local(inst["name"])
-            else:
-                findings = collect_remote(inst, ssh_run)
+            findings = _collect_security_findings(inst)
 
-            # Analyze with LLM
-            llm_output = asyncio.run(analyze_with_bedrock(findings))
+            # Authoritative assessment is sent before, and independently of, the model.
+            send_security_assessment(inst['chat_id'], inst, findings, timestamp)
 
-            # Send chunks
-            chunks = format_telegram_report(inst["name"], llm_output, timestamp)
-            for chunk in chunks:
-                send_message(inst['chat_id'], chunk)
+            # Advisory analysis
+            llm_output, llm_error = _call_security_model(findings)
+            send_security_advisory(
+                inst['chat_id'], inst, timestamp, llm_output, llm_error)
 
             print(f"[{timestamp}] Nightly security report sent for {inst['name']}.")
 
@@ -876,38 +1111,63 @@ def run_nightly_security_analysis():
             )
 
 
-# ─── MAIN ─────────────────────────────────────────────────
+def main():
+    global BOT_TOKEN, CPU_ALERT_THRESHOLD, MEMORY_ALERT_THRESHOLD
+    global DISK_ALERT_THRESHOLD, REPORT_INTERVAL, INSTANCES, CHAT_TO_INSTANCE
 
-# schedule.every(REPORT_INTERVAL).minutes.do(send_scheduled_reports)
-schedule.every(1).minutes.do(check_all_alerts)
-schedule.every(5).minutes.do(log_all_metrics)
-schedule.every().day.at("15:00").do(run_nightly_security_analysis)   # ← 11 PM PHT
+    load_dotenv()
+    BOT_TOKEN = os.getenv("BOT_TOKEN")
+    if not BOT_TOKEN:
+        raise ValueError("❌ BOT_TOKEN must be set in .env file")
+    CPU_ALERT_THRESHOLD = int(os.getenv("CPU_ALERT_THRESHOLD", 80))
+    MEMORY_ALERT_THRESHOLD = int(os.getenv("MEMORY_ALERT_THRESHOLD", 85))
+    DISK_ALERT_THRESHOLD = int(os.getenv("DISK_ALERT_THRESHOLD", 90))
+    REPORT_INTERVAL = int(os.getenv("REPORT_INTERVAL", 30))
+    INSTANCES = load_instances()
+    CHAT_TO_INSTANCE = {inst["chat_id"]: inst for inst in INSTANCES}
 
-# Command listener thread
-thread = threading.Thread(target=handle_commands, daemon=True)
-thread.start()
+    print(f"[CONFIG] Loaded {len(INSTANCES)} instance(s):")
+    for inst in INSTANCES:
+        if inst["is_local"]:
+            mode = "local (psutil)"
+        elif inst["is_windows"]:
+            mode = f"Windows SSH | user={inst['ssh_user']} | key={inst['key']}"
+        else:
+            mode = f"Linux SSH | user={inst['ssh_user']} | key={inst['key']}"
+        print(f"  {inst['index']}. {inst['name']} ({inst['ip']}) → {mode} → chat {inst['chat_id']}")
 
-# Startup notifications
-print("✅ Central EC2 Monitor starting...")
-for inst in INSTANCES:
-    if inst["is_local"]:
-        mode = "local"
-    elif inst["is_windows"]:
-        mode = "Windows SSH"
-    else:
-        mode = "Linux SSH"
-    send_message(
-        inst['chat_id'],
-        f"✅ *{inst['name']} Monitor Started*\n\n"
-        f"📡 Mode: `{mode}`\n"
-        f"🔔 Thresholds — CPU: `{CPU_ALERT_THRESHOLD}%` | RAM: `{MEMORY_ALERT_THRESHOLD}%` | Disk: `{DISK_ALERT_THRESHOLD}%`\n"
-        f"🔐 Nightly security scan at `23:00 PHT`\n\n"
-        f"Type /help for available commands."
-    )
+    # schedule.every(REPORT_INTERVAL).minutes.do(send_scheduled_reports)
+    schedule.every(1).minutes.do(check_all_alerts)
+    schedule.every(5).minutes.do(log_all_metrics)
+    schedule.every().day.at("15:00").do(run_nightly_security_analysis)   # ← 11 PM PHT
 
-log_all_metrics()
+    thread = threading.Thread(target=handle_commands, daemon=True)
+    thread.start()
 
-print("Monitor running... Press Ctrl+C to stop.")
-while True:
-    schedule.run_pending()
-    time.sleep(30)
+    print("✅ Central EC2 Monitor starting...")
+    for inst in INSTANCES:
+        if inst["is_local"]:
+            mode = "local"
+        elif inst["is_windows"]:
+            mode = "Windows SSH"
+        else:
+            mode = "Linux SSH"
+        send_message(
+            inst['chat_id'],
+            f"✅ *{inst['name']} Monitor Started*\n\n"
+            f"📡 Mode: `{mode}`\n"
+            f"🔔 Thresholds — CPU: `{CPU_ALERT_THRESHOLD}%` | RAM: `{MEMORY_ALERT_THRESHOLD}%` | Disk: `{DISK_ALERT_THRESHOLD}%`\n"
+            f"🔐 Nightly security scan at `23:00 PHT`\n\n"
+            f"Type /help for available commands."
+        )
+
+    log_all_metrics()
+
+    print("Monitor running... Press Ctrl+C to stop.")
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+
+if __name__ == "__main__":
+    main()

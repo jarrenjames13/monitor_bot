@@ -7,35 +7,24 @@ or SSH (remote). Returns a structured dict of findings per instance.
 Called by the scheduled 11 PM job and by the /security command.
 """
 
+import base64
+import ipaddress
 import json
+import os
+import socket
 import subprocess
 import threading
 from datetime import datetime
 
 import psutil
 
-# Import whitelists
 try:
-    from security_whitelist import (
-        SAFE_EXTERNAL_IPS, SAFE_PORTS, SAFE_LOCALHOST_ADDRS,
-        SAFE_ADMIN_USERS, SAFE_SSH_SOURCES,
-        ALLOW_NORMAL_HTTPS_OUTBOUND, MAX_NORMAL_HTTPS_CONNECTIONS,
-        SAFE_PROCESS_NAMES, SAFE_ZOMBIE_PATTERNS,
-        EPHEMERAL_PORT_MIN, EPHEMERAL_PORT_MAX
-    )
+    # Only the zombie-noise allowlist is still consulted directly. The other
+    # legacy lists (SAFE_PORTS, SAFE_EXTERNAL_IPS, ...) no longer preclassify or
+    # suppress network evidence; see _classify_observation.
+    from security_whitelist import SAFE_ZOMBIE_PATTERNS
 except ImportError:
-    # Fallback if whitelist file doesn't exist
-    SAFE_EXTERNAL_IPS = {"121.58.203.121"}
-    SAFE_PORTS = {22, 53, 80, 443, 5001, 3306, 33060, 5432, 6379, 8080, 8443, 27017}
-    SAFE_LOCALHOST_ADDRS = {"127.0.0.53", "127.0.0.54"}
-    SAFE_ADMIN_USERS = {"ubuntu", "admin"}
-    SAFE_SSH_SOURCES = {"121.58.203.121"}
-    ALLOW_NORMAL_HTTPS_OUTBOUND = True
-    MAX_NORMAL_HTTPS_CONNECTIONS = 30
-    SAFE_PROCESS_NAMES = {"chrome", "chrome-headless", "python", "python3", "node"}
     SAFE_ZOMBIE_PATTERNS = {"chrome", "chromium", "node", "python"}
-    EPHEMERAL_PORT_MIN = 32768
-    EPHEMERAL_PORT_MAX = 65535
 
 # ─── KNOWN-SAFE BASELINES ─────────────────────────────────
 # Extend these lists to match your normal environment.
@@ -66,13 +55,13 @@ _lock = threading.Lock()
 
 # ─── LOCAL COLLECTION (psutil) ────────────────────────────
 
-def collect_local(inst_name: str) -> dict:
+def collect_local(inst_name: str, security_config: dict | None = None) -> dict:
     """Gather security signals from the local machine using psutil + subprocess."""
     findings = _base_findings(inst_name, "local")
 
     with _lock:
         _scan_processes_local(findings)
-        _scan_network_local(findings)
+        _scan_network_local(findings, security_config or {})
         _scan_users_local(findings)
         _scan_files_local(findings)
         _scan_services_local(findings)
@@ -134,44 +123,180 @@ def _scan_processes_local(f: dict):
     f["processes"]["zombies"]         = zombies
 
 
-def _scan_network_local(f: dict):
-    listening = []
-    established = []
-    suspicious_conns = []
+def _scan_network_local(f: dict, security_config: dict | None = None):
+    network = f["network"]
+    raw = []
+    gaps = []
+    process_map, process_gaps = _local_process_map()
+    gaps.extend(process_gaps)
+    try:
+        connections = psutil.net_connections(kind="inet")
+    except Exception as exc:
+        gaps.append(f"Socket enumeration failed: {type(exc).__name__}: {exc}")
+        _finalize_network(f, raw, [], "unavailable", gaps, security_config or {}, "partial")
+        return
 
-    for conn in psutil.net_connections(kind="inet"):
+    for conn in connections:
         try:
-            laddr = conn.laddr
-            raddr = conn.raddr
-            status = conn.status
+            local = _address_parts(conn.laddr)
+            remote = _address_parts(conn.raddr)
+            conn_type = getattr(conn, "type", None)
+            protocol = "tcp" if conn_type == socket.SOCK_STREAM else (
+                "udp" if conn_type == socket.SOCK_DGRAM else "unknown"
+            )
+            state = str(getattr(conn, "status", "") or "UNKNOWN")
+            is_listener = state == "LISTEN" or (
+                protocol == "udp" and bool(local["ip"])
+                and remote["ip"] is None
+            )
+            pid = getattr(conn, "pid", None)
+            owner = process_map.get(pid, _unknown_owner(pid))
+            raw.append({
+                "protocol": protocol,
+                "local_ip": local["ip"],
+                "local_port": local["port"],
+                "remote_ip": remote["ip"],
+                "remote_port": remote["port"],
+                "state": state,
+                "is_listener": is_listener,
+                "pid": pid,
+                "owner": owner,
+            })
+        except Exception as exc:
+            gaps.append(f"Socket record unavailable: {type(exc).__name__}: {exc}")
 
-            if status == "LISTEN":
-                port = laddr.port if laddr else None
-                addr_ip = laddr.ip if laddr else ""
-                
-                # Skip safe ports, ephemeral ports, and systemd-resolved on localhost
-                if port and port not in SAFE_PORTS:
-                    # Allow port 53 on localhost (systemd-resolved)
-                    if port == 53 and addr_ip in SAFE_LOCALHOST_ADDRS:
-                        continue
-                    # Skip ephemeral ports (high-numbered temporary ports)
-                    if EPHEMERAL_PORT_MIN <= port <= EPHEMERAL_PORT_MAX:
-                        continue
-                    listening.append({"port": port, "addr": str(laddr)})
+    docker_containers = []
+    docker_status = "not_required"
+    if any(item.get("local_port") == 13133
+           or _docker_owner_verified(item.get("owner") or {}) for item in raw):
+        docker_containers, docker_status, docker_error = _docker_snapshot()
+        if docker_error:
+            gaps.append(docker_error)
+    scan_status = "partial" if gaps else "complete"
+    _finalize_network(
+        f, raw, docker_containers, docker_status, gaps, security_config or {}, scan_status
+    )
 
-            elif status == "ESTABLISHED" and raddr:
-                rip = raddr.ip
-                # Skip known safe external IPs and private IPs
-                if rip not in SAFE_EXTERNAL_IPS and not _is_private_ip(rip):
-                    established.append({
-                        "local":  str(laddr),
-                        "remote": str(raddr),
-                    })
-        except Exception:
+
+def _local_process_map():
+    processes = {}
+    gaps = []
+    try:
+        iterator = psutil.process_iter(
+            ["pid", "ppid", "name", "exe", "cmdline", "username"]
+        )
+        for proc in iterator:
+            try:
+                info = proc.info
+                pid = info.get("pid")
+                if pid is None:
+                    continue
+                processes[pid] = {
+                    "pid": pid,
+                    "ppid": info.get("ppid"),
+                    "name": info.get("name") or "unknown",
+                    "exe": info.get("exe") or "unknown",
+                    "cmdline": _sanitize_cmdline(info.get("cmdline")),
+                    "user": info.get("username") or "unknown",
+                    "parent_exe": "unknown",
+                }
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                gaps.append("Some process identity fields were inaccessible")
+            except Exception as exc:
+                gaps.append(f"Process identity lookup failed: {type(exc).__name__}")
+    except Exception as exc:
+        gaps.append(f"Process enumeration failed: {type(exc).__name__}: {exc}")
+    for owner in processes.values():
+        parent = processes.get(owner.get("ppid"))
+        if parent:
+            owner["parent_exe"] = parent.get("exe") or "unknown"
+    return processes, list(dict.fromkeys(gaps))
+
+
+def _docker_snapshot():
+    """Read running-container publication metadata without invoking a shell."""
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--no-trunc", "--quiet"],
+            capture_output=True, text=True, timeout=8,
+        )
+    except Exception as exc:
+        return [], "unavailable", f"Docker identity lookup failed: {type(exc).__name__}: {exc}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "nonzero exit").strip()[:240]
+        return [], "error", f"Docker identity lookup failed: {detail}"
+
+    containers = []
+    for container_id in result.stdout.splitlines():
+        container_id = container_id.strip()
+        if not container_id:
             continue
+        try:
+            inspected = subprocess.run(
+                ["docker", "inspect", container_id],
+                capture_output=True, text=True, timeout=8,
+            )
+        except Exception as exc:
+            return containers, "partial", f"Docker inspect failed: {type(exc).__name__}: {exc}"
+        if inspected.returncode != 0:
+            detail = (inspected.stderr or inspected.stdout or "nonzero exit").strip()[:240]
+            return containers, "partial", f"Docker inspect failed: {detail}"
+        try:
+            values = json.loads(inspected.stdout)
+            if not isinstance(values, list) or len(values) != 1:
+                raise ValueError("inspect did not return one container")
+            item = values[0]
+            containers.append({
+                "id": item.get("Id"),
+                "name": str(item.get("Name", "")).lstrip("/"),
+                "image": item.get("Config", {}).get("Image"),
+                "image_id": item.get("Image"),
+                "running": item.get("State", {}).get("Running") is True,
+                "ports": item.get("NetworkSettings", {}).get("Ports") or {},
+            })
+        except Exception as exc:
+            return containers, "partial", f"Docker inspect response invalid: {type(exc).__name__}"
+    return containers, "available", None
 
-    f["network"]["unexpected_listening"] = listening
-    f["network"]["external_connections"]  = established[:20]  # cap at 20
+
+def _address_parts(address):
+    if not address:
+        return {"ip": None, "port": None}
+    if isinstance(address, (tuple, list)):
+        return {
+            "ip": str(address[0]) if address else None,
+            "port": int(address[1]) if len(address) > 1 and address[1] is not None else None,
+        }
+    return {
+        "ip": getattr(address, "ip", None),
+        "port": getattr(address, "port", None),
+    }
+
+
+def _sanitize_cmdline(cmdline):
+    if not isinstance(cmdline, (list, tuple)):
+        return []
+    safe = []
+    redact_next = False
+    for raw_arg in cmdline:
+        arg = str(raw_arg)
+        if redact_next:
+            safe.append("[REDACTED]")
+            redact_next = False
+            continue
+        key, separator, value = arg.partition("=")
+        normalized = key.lstrip("-").lower().replace("_", "-")
+        if normalized in {"password", "passwd", "token", "secret", "api-key", "access-key", "credential"}:
+            if separator:
+                safe.append(f"{key}=[REDACTED]")
+            else:
+                safe.append(arg)
+                redact_next = True
+        elif separator and any(word in normalized for word in ("password", "token", "secret", "credential", "api-key")):
+            safe.append(f"{key}=[REDACTED]")
+        else:
+            safe.append(arg)
+    return safe
 
 
 def _scan_users_local(f: dict):
@@ -217,10 +342,17 @@ def _scan_cron_local(f: dict):
 
 
 def _scan_auth_log_local(f: dict):
-    """Pull last 50 auth log lines — failed SSH, sudo, new user events."""
+    """
+    Pull the last 50 auth log lines unfiltered.
+
+    Collection never narrows the evidence: PAM authentication failures, pre-auth
+    connection and disconnection events from a remote source, and account or
+    credential changes all reach `auth_log`, so `has_any_findings`,
+    corroboration, the prompt and the report can all see them. Benign noise is
+    reduced only at presentation time.
+    """
     auth = _run_local(
-        "grep -Ei 'failed|invalid|error|sudo|useradd|userdel|passwd' "
-        "/var/log/auth.log 2>/dev/null | tail -50"
+        "tail -50 /var/log/auth.log 2>/dev/null"
     )
     f["auth_log"] = auth.splitlines() if auth else []
 
@@ -237,124 +369,260 @@ def _run_local(cmd: str) -> str:
 
 # ─── REMOTE COLLECTION (SSH) ──────────────────────────────
 
-# Shared python3 inline script that runs on the remote host
-_REMOTE_PYTHON = r"""python3 -c "
-import psutil, json, subprocess, os, glob
+# Shared python3 program that runs on the remote Linux host. It emits the same
+# raw socket/process/container evidence the local collector produces, so the
+# classification policy below is shared by both paths. A missing psutil or any
+# unexpected failure leaves the process with a nonzero exit status: a failed
+# remote scan is never reported as a clean scan.
+_REMOTE_SCRIPT = r'''import json, os, socket, subprocess
 from datetime import datetime
+import psutil
+
+SUSP_NAMES = {'nc','netcat','ncat','nmap','masscan','socat','xmrig','cgminer','minerd','ethminer','msfconsole','hydra','sqlmap','john','hashcat','mimikatz'}
+SUSP_PATHS = ['/tmp/','/dev/shm/','/var/tmp/','/run/shm/']
+SAFE_ZOMBIES = {'chrome','chromium','node','python'}
 
 findings = {
     'processes': {'high_cpu': [], 'high_mem': [], 'suspicious_name': [], 'suspicious_path': [], 'zombies': []},
-    'network':   {'unexpected_listening': [], 'external_connections': []},
-    'users':     {'logged_in': []},
-    'files':     {'recently_modified_system': []},
-    'services':  {'failed': [], 'new_units': []},
-    'cron':      {'entries': []},
-    'auth_log':  [],
+    'network': {'raw_observations': [], 'docker_containers': [], 'docker_status': 'not_required',
+                'scan_status': 'complete', 'scan_gaps': []},
+    'users': {'logged_in': []},
+    'files': {'recently_modified_system': []},
+    'services': {'failed': [], 'new_units': []},
+    'cron': {'entries': []},
+    'auth_log': [],
 }
 
-SUSP_NAMES = {'nc','netcat','ncat','nmap','masscan','socat','xmrig','cgminer','minerd','ethminer','msfconsole','hydra','sqlmap','john','hashcat'}
-SUSP_PATHS = ['/tmp/','/dev/shm/','/var/tmp/','/run/shm/']
-SAFE_PORTS  = {22,53,80,443,5001,8080,8443,3306,33060,5432,6379,27017}
-SAFE_LOCALHOST = {'127.0.0.53','127.0.0.54'}
-SAFE_ZOMBIES = {'chrome','chromium','node','python'}
-EPHEMERAL_MIN = 32768
-EPHEMERAL_MAX = 65535
+def _base_name(path):
+    return os.path.basename(str(path or '').rstrip('/')) if path else ''
 
-def is_private(ip):
-    parts = ip.split('.')
-    if len(parts) != 4: return True
-    try:
-        a = int(parts[0]); b = int(parts[1])
-        return a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168) or a == 127
-    except: return True
+def _docker_proxy(owner):
+    owner = owner or {}
+    return (_base_name(owner.get('name')) == 'docker-proxy'
+            or _base_name(owner.get('exe')) == 'docker-proxy'
+            or _base_name(owner.get('parent_exe')) in ('dockerd', 'docker'))
 
 def run(cmd):
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
-        return r.stdout.strip()
-    except: return ''
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        return result.stdout.strip()
+    except Exception:
+        return ''
 
-# Processes
-for p in psutil.process_iter(['pid','name','exe','username','cpu_percent','memory_percent','status']):
+process_map = {}
+try:
+    for process in psutil.process_iter(['pid','ppid','name','exe','cmdline','username','cpu_percent','memory_percent','status']):
+        try:
+            i = process.info
+            pid = i.get('pid')
+            name = i.get('name') or ''
+            exe = i.get('exe') or ''
+            user = i.get('username') or ''
+            process_map[pid] = {'pid': pid, 'ppid': i.get('ppid'), 'name': name or 'unknown',
+                                'exe': exe or 'unknown', 'cmdline': i.get('cmdline') or [],
+                                'user': user or 'unknown', 'parent_exe': 'unknown'}
+            cpu = i.get('cpu_percent') or 0
+            mem = i.get('memory_percent') or 0
+            if (i.get('status') or '') == 'zombie' and not any(z in name.lower() for z in SAFE_ZOMBIES):
+                findings['processes']['zombies'].append({'pid': pid, 'name': name})
+            if cpu >= 50:
+                findings['processes']['high_cpu'].append({'pid': pid, 'name': name, 'cpu': round(cpu, 1), 'user': user, 'exe': exe})
+            if mem >= 30:
+                findings['processes']['high_mem'].append({'pid': pid, 'name': name, 'mem': round(mem, 1), 'user': user, 'exe': exe})
+            if name.lower() in SUSP_NAMES:
+                findings['processes']['suspicious_name'].append({'pid': pid, 'name': name, 'exe': exe, 'user': user})
+            if exe and any(exe.startswith(path) for path in SUSP_PATHS):
+                findings['processes']['suspicious_path'].append({'pid': pid, 'name': name, 'exe': exe, 'user': user})
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            findings['network']['scan_gaps'].append('Some process identity fields were inaccessible')
+        except Exception as exc:
+            findings['network']['scan_gaps'].append('Process identity lookup failed: ' + type(exc).__name__)
+except Exception as exc:
+    findings['network']['scan_gaps'].append('Process enumeration failed: ' + type(exc).__name__ + ': ' + str(exc))
+for owner in process_map.values():
+    parent = process_map.get(owner.get('ppid'))
+    if parent:
+        owner['parent_exe'] = parent.get('exe') or 'unknown'
+
+try:
+    connections = psutil.net_connections(kind='inet')
+except Exception as exc:
+    connections = []
+    findings['network']['scan_gaps'].append('Socket enumeration failed: ' + type(exc).__name__ + ': ' + str(exc))
+for conn in connections:
     try:
-        i = p.info
-        name=i.get('name',''); exe=i.get('exe','') or ''; cpu=i.get('cpu_percent') or 0; mem=i.get('memory_percent') or 0; status=i.get('status',''); user=i.get('username','')
-        # Filter out safe zombie processes
-        if status == 'zombie':
-            if not any(z in name.lower() for z in SAFE_ZOMBIES):
-                findings['processes']['zombies'].append({'pid':i['pid'],'name':name})
-        if cpu >= 50: findings['processes']['high_cpu'].append({'pid':i['pid'],'name':name,'cpu':round(cpu,1),'user':user,'exe':exe})
-        if mem >= 30: findings['processes']['high_mem'].append({'pid':i['pid'],'name':name,'mem':round(mem,1),'user':user,'exe':exe})
-        if name.lower() in SUSP_NAMES: findings['processes']['suspicious_name'].append({'pid':i['pid'],'name':name,'exe':exe,'user':user})
-        if exe and any(exe.startswith(s) for s in SUSP_PATHS): findings['processes']['suspicious_path'].append({'pid':i['pid'],'name':name,'exe':exe,'user':user})
-    except: pass
+        def parts(address):
+            if not address:
+                return None, None
+            if isinstance(address, (tuple, list)):
+                return (str(address[0]) if address else None), (address[1] if len(address) > 1 else None)
+            return getattr(address, 'ip', None), getattr(address, 'port', None)
+        local_ip, local_port = parts(conn.laddr)
+        remote_ip, remote_port = parts(conn.raddr)
+        conn_type = getattr(conn, 'type', None)
+        protocol = 'tcp' if conn_type == socket.SOCK_STREAM else ('udp' if conn_type == socket.SOCK_DGRAM else 'unknown')
+        state = str(getattr(conn, 'status', '') or 'UNKNOWN')
+        is_listener = state == 'LISTEN' or (protocol == 'udp' and local_ip is not None and remote_ip is None)
+        pid = getattr(conn, 'pid', None)
+        owner = process_map.get(pid, {'pid': pid, 'ppid': None, 'name': 'unknown', 'exe': 'unknown',
+                                      'cmdline': [], 'user': 'unknown', 'parent_exe': 'unknown'})
+        findings['network']['raw_observations'].append({'protocol': protocol, 'local_ip': local_ip,
+            'local_port': local_port, 'remote_ip': remote_ip, 'remote_port': remote_port,
+            'state': state, 'is_listener': is_listener, 'pid': pid, 'owner': owner})
+    except Exception as exc:
+        findings['network']['scan_gaps'].append('Socket record unavailable: ' + type(exc).__name__)
 
-# Network
-for c in psutil.net_connections(kind='inet'):
+if any(item.get('local_port') == 13133 or _docker_proxy(item.get('owner') or {}) for item in findings['network']['raw_observations']):
     try:
-        la=c.laddr; ra=c.raddr; st=c.status
-        if st=='LISTEN' and la:
-            # Skip systemd-resolved on localhost, safe ports, and ephemeral ports
-            if la.port == 53 and la.ip in SAFE_LOCALHOST:
-                continue
-            if la.port in SAFE_PORTS:
-                continue
-            if EPHEMERAL_MIN <= la.port <= EPHEMERAL_MAX:
-                continue
-            findings['network']['unexpected_listening'].append({'port':la.port,'addr':str(la)})
-        elif st=='ESTABLISHED' and ra and not is_private(ra.ip): findings['network']['external_connections'].append({'local':str(la),'remote':str(ra)})
-    except: pass
-findings['network']['external_connections'] = findings['network']['external_connections'][:20]
+        listed = subprocess.run(['docker','ps','--no-trunc','--quiet'], capture_output=True, text=True, timeout=8)
+        if listed.returncode != 0:
+            findings['network']['docker_status'] = 'error'
+            findings['network']['scan_gaps'].append('Docker identity lookup failed: ' + (listed.stderr or listed.stdout or 'nonzero exit').strip()[:240])
+        else:
+            findings['network']['docker_status'] = 'available'
+            for container_id in listed.stdout.splitlines():
+                if not container_id.strip():
+                    continue
+                inspected = subprocess.run(['docker','inspect',container_id.strip()], capture_output=True, text=True, timeout=8)
+                if inspected.returncode != 0:
+                    findings['network']['docker_status'] = 'partial'
+                    findings['network']['scan_gaps'].append('Docker inspect failed: ' + (inspected.stderr or inspected.stdout or 'nonzero exit').strip()[:240])
+                    break
+                value = json.loads(inspected.stdout)
+                if not isinstance(value, list) or len(value) != 1:
+                    raise ValueError('inspect did not return one container')
+                item = value[0]
+                findings['network']['docker_containers'].append({'id': item.get('Id'),
+                    'name': str(item.get('Name','')).lstrip('/'),
+                    'image': item.get('Config', {}).get('Image'), 'image_id': item.get('Image'),
+                    'running': item.get('State', {}).get('Running') is True,
+                    'ports': item.get('NetworkSettings', {}).get('Ports') or {}})
+    except Exception as exc:
+        findings['network']['docker_status'] = 'error'
+        findings['network']['scan_gaps'].append('Docker identity lookup failed: ' + type(exc).__name__ + ': ' + str(exc))
 
-# Users
+if findings['network']['scan_gaps']:
+    findings['network']['scan_status'] = 'partial'
+
 for u in psutil.users():
-    findings['users']['logged_in'].append({'name':u.name,'terminal':u.terminal,'host':u.host,'started':str(datetime.fromtimestamp(u.started))})
-
-# Files
-mod = run(\"find /etc /bin /sbin /usr/bin /usr/sbin -newer /tmp -type f -printf '%T+ %p\n' 2>/dev/null | sort -r | head -20\")
+    findings['users']['logged_in'].append({'name': u.name, 'terminal': u.terminal, 'host': u.host,
+                                           'started': str(datetime.fromtimestamp(u.started))})
+mod = run("find /etc /bin /sbin /usr/bin /usr/sbin -newer /tmp -type f -printf '%T+ %p\n' 2>/dev/null | sort -r | head -20")
 findings['files']['recently_modified_system'] = mod.splitlines() if mod else []
-
-# Services
 failed = run('systemctl list-units --type=service --state=failed --no-pager --no-legend 2>/dev/null | head -20')
 findings['services']['failed'] = failed.splitlines() if failed else []
-
-# Cron
+new_units = run("find /etc/systemd /usr/lib/systemd -name '*.service' -newer /tmp -type f 2>/dev/null | head -20")
+findings['services']['new_units'] = new_units.splitlines() if new_units else []
 cron = run('crontab -l 2>/dev/null; ls /etc/cron.d/ 2>/dev/null; ls /var/spool/cron/crontabs/ 2>/dev/null')
 findings['cron']['entries'] = cron.splitlines() if cron else []
-
-# Auth log
-auth = run(\"grep -Ei 'failed|invalid|error|sudo|useradd|userdel|passwd' /var/log/auth.log 2>/dev/null | tail -50\")
+auth = run("grep -Ei 'failed|invalid|error|sudo|useradd|userdel|passwd' /var/log/auth.log 2>/dev/null | tail -50")
 findings['auth_log'] = auth.splitlines() if auth else []
-
 print(json.dumps(findings))
-"
-"""
+'''
+
+_EXIT_TRAILER = "\n__AURORA_SECURITY_EXIT__="
 
 
-def collect_remote(inst: dict, ssh_run_fn) -> dict:
+def _build_remote_command():
+    """The SSH command is static shell text: the script travels as base64 data."""
+    encoded = base64.b64encode(_REMOTE_SCRIPT.encode("utf-8")).decode("ascii")
+    return (
+        "python3 -c \"import base64;exec(base64.b64decode('" + encoded + "'))\"; "
+        "rc=$?; printf '\\n__AURORA_SECURITY_EXIT__=%s\\n' \"$rc\"; exit \"$rc\""
+    )
+
+
+# Kept as a module-level name for callers/tests that referenced the old constant.
+_REMOTE_PYTHON = _build_remote_command()
+
+
+def collect_remote(inst: dict, ssh_run_fn, security_config: dict | None = None) -> dict:
     """
-    Gather security signals from a remote instance via SSH.
-    ssh_run_fn: the ssh_run(inst, cmd) function from main.py
+    Gather structured Linux evidence from a remote instance via the caller's SSH runner.
+    Empty, invalid, or nonzero remote responses are reported as failed scans.
     """
     findings = _base_findings(inst["name"], "remote")
+    output = ssh_run_fn(inst, _build_remote_command())
 
-    output = ssh_run_fn(inst, _REMOTE_PYTHON)
     if output is None:
-        findings["error"] = "SSH unreachable"
+        _fail_scan(findings, "SSH unreachable", security_config)
+        return findings
+
+    response = str(output)
+    exit_code = None
+    if _EXIT_TRAILER in response:
+        response, _, trailer = response.rpartition(_EXIT_TRAILER)
+        exit_code = trailer.strip().splitlines()[0].strip() if trailer.strip() else ""
+    if exit_code != "0":
+        message = (
+            "Remote security scanner exited nonzero"
+            if exit_code
+            else "Remote security scanner response is missing its exit status"
+        )
+        remote_data = _parse_remote_payload(response)
+        if remote_data is None:
+            _fail_scan(findings, message, security_config)
+            return findings
+        # A failed scan that still returned evidence keeps that evidence.
+        for section, value in remote_data.items():
+            findings[section] = value
+        network = findings.get("network", {})
+        _finalize_network(
+            findings,
+            network.pop("raw_observations", []),
+            network.pop("docker_containers", []),
+            network.get("docker_status", "unavailable"),
+            [message] + list(network.get("scan_gaps", [])),
+            security_config or {},
+            "failed",
+        )
+        findings["error"] = message
         return findings
 
     try:
-        remote_data = json.loads(output)
-        # Merge remote_data into findings
-        for section, value in remote_data.items():
-            if section in findings:
-                findings[section] = value
-            else:
-                findings[section] = value
-    except json.JSONDecodeError as e:
-        findings["error"] = f"JSON parse error: {e} | raw: {output[:200]}"
+        remote_data = _parse_remote_payload(response)
+        if remote_data is None:
+            raise ValueError("scanner response is missing its network evidence")
+    except Exception as exc:
+        _fail_scan(
+            findings, f"Invalid remote security response: {type(exc).__name__}: {exc}",
+            security_config,
+        )
+        return findings
 
+    for section, value in remote_data.items():
+        findings[section] = value
+
+    network = findings.get("network", {})
+    _finalize_network(
+        findings,
+        network.pop("raw_observations", []),
+        network.pop("docker_containers", []),
+        network.get("docker_status", "unavailable"),
+        network.get("scan_gaps", []),
+        security_config or {},
+        network.get("scan_status", "unknown"),
+    )
     return findings
+
+
+def _parse_remote_payload(response):
+    """Return the remote payload dict, or None when it is not usable."""
+    try:
+        remote_data = json.loads(response)
+    except Exception:
+        return None
+    if not isinstance(remote_data, dict) or not isinstance(remote_data.get("network"), dict):
+        return None
+    return remote_data
+
+
+def _fail_scan(findings: dict, message: str, security_config: dict | None = None):
+    """Record a failed scan without erasing any evidence already collected."""
+    findings["error"] = message
+    _finalize_network(
+        findings, [], [], "unavailable", [message], security_config or {}, "failed"
+    )
 
 
 # ─── HELPERS ──────────────────────────────────────────────
@@ -372,8 +640,15 @@ def _base_findings(name: str, mode: str) -> dict:
             "zombies":         [],
         },
         "network": {
+            "observations":      [],
+            "category_counts":   {},
+            "totals":            {},
+            "risk":              {},
             "unexpected_listening": [],
-            "external_connections": [],
+            "external_connections":  [],
+            "scan_status":       "unknown",
+            "scan_gaps":         [],
+            "docker_status":     "not_required",
         },
         "users":    {"logged_in": []},
         "files":    {"recently_modified_system": []},
@@ -384,30 +659,762 @@ def _base_findings(name: str, mode: str) -> dict:
     }
 
 
-def _is_private_ip(ip: str) -> bool:
-    """Return True if IP is RFC1918, loopback, or link-local."""
-    parts = ip.split(".")
-    if len(parts) != 4:
-        return True
+# ─── NETWORK EVIDENCE + CENTRAL CLASSIFICATION POLICY ─────
+# One policy, used by the local and the SSH-remote collectors. Nothing here
+# trusts a port number, an address, a process basename, a container name, or an
+# ephemeral port on its own: a classification is only "expected" when the
+# operator configured the identity and the collected evidence matches it.
+
+CLASSIFICATIONS = (
+    "benign", "expected", "informational", "needs_review", "suspicious",
+    "high_risk", "unknown",
+)
+DIRECTIONS = ("inbound", "outbound", "uncertain")
+BIND_SCOPES = (
+    "loopback-only", "private-interface", "all-interfaces", "public-interface",
+    "unknown",
+)
+DEFAULT_OTEL_TARGET_PORT = 13133
+BOT_HTTPS_PORT = 443
+EPHEMERAL_PORT_MIN = 32768
+_SCRIPT_INTERPRETERS = {"python", "python3", "python2", "perl", "ruby", "node", "php", "sh", "bash"}
+
+
+def _unknown_owner(pid):
+    return {
+        "pid": pid, "ppid": None, "name": "unknown", "exe": "unknown",
+        "cmdline": [], "user": "unknown", "parent_exe": "unknown",
+    }
+
+
+def _basename(path):
+    if not path or path == "unknown":
+        return ""
+    return os.path.basename(str(path).rstrip("/")) or str(path)
+
+
+def _is_loopback(ip):
+    if not ip:
+        return False
     try:
-        a, b = int(parts[0]), int(parts[1])
-        return (
-            a == 10
-            or (a == 172 and 16 <= b <= 31)
-            or (a == 192 and b == 168)
-            or a == 127
-        )
+        return ipaddress.ip_address(str(ip).split("%")[0]).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_private(ip):
+    """True for the host-local networks the legacy external list excluded."""
+    if not ip:
+        return False
+    try:
+        address = ipaddress.ip_address(str(ip).split("%")[0])
     except ValueError:
         return True
+    if address.version == 6:
+        return address.is_loopback or address.is_link_local or address in _ULA
+    return any(address in network for network in _RFC1918)
+
+
+def _is_public(ip):
+    """True when the address is reached over the network rather than host-local."""
+    if not ip:
+        return False
+    return not _is_private(ip) and not _is_loopback(ip)
+
+
+_RFC1918 = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+_ULA = ipaddress.ip_network("fc00::/7")
+
+
+def _ip_matches(ip, entries, port=None):
+    """Match an address against operator-configured exact addresses or CIDRs."""
+    if not ip or not entries:
+        return None
+    for entry in entries:
+        entry = str(entry).strip()
+        if not entry:
+            continue
+        expected_port = None
+        if entry.count(":") == 1:
+            entry, _, port_text = entry.partition(":")
+            if port_text.isdigit():
+                expected_port = int(port_text)
+        try:
+            if "/" in entry:
+                matched = ipaddress.ip_address(str(ip).split("%")[0]) in ipaddress.ip_network(entry, strict=False)
+            else:
+                matched = str(ip).split("%")[0] == entry
+        except ValueError:
+            continue
+        if matched and (expected_port is None or port == expected_port):
+            return entry
+    return None
+
+
+def _bind_scope(ip):
+    if ip is None or str(ip) in ("0.0.0.0", "::", "*", ""):
+        return "all-interfaces"
+    if _is_loopback(ip):
+        return "loopback-only"
+    if _is_private(ip):
+        return "private-interface"
+    if _is_public(ip):
+        return "public-interface"
+    return "unknown"
+
+
+def _endpoint(ip, port):
+    if ip is None and port is None:
+        return "unknown"
+    return f"{ip}:{port}" if port is not None else str(ip)
+
+
+def _is_ephemeral_port(port):
+    """Client sockets use an OS assigned high port; a low one is a deviation."""
+    try:
+        return int(port) >= EPHEMERAL_PORT_MIN
+    except (TypeError, ValueError):
+        return False
+
+
+def _observation(raw, direction, bind_scope, container, classification,
+                 confidence, reason, evidence):
+    owner = raw.get("owner") or _unknown_owner(raw.get("pid"))
+    return {
+        "protocol":     raw.get("protocol") or "unknown",
+        "state":        raw.get("state") or "UNKNOWN",
+        "local_ip":     raw.get("local_ip"),
+        "local_port":   raw.get("local_port"),
+        "remote_ip":    raw.get("remote_ip"),
+        "remote_port":  raw.get("remote_port"),
+        "direction":    direction,
+        "bind_scope":   bind_scope,
+        "is_listener":  bool(raw.get("is_listener")),
+        "pid":          raw.get("pid"),
+        "process":      {
+            "name":      owner.get("name") or "unknown",
+            "exe":       owner.get("exe") or "unknown",
+            "cmdline":   owner.get("cmdline") or [],
+            "user":      owner.get("user") or "unknown",
+            "parent_exe": owner.get("parent_exe") or "unknown",
+        },
+        "container":    container,
+        "classification": classification,
+        "confidence":   confidence,
+        "reason":       reason,
+        "evidence":     evidence,
+    }
+
+
+def _listener_matches(listener_ip, listener_port, ip, port):
+    """A peer uses this listener when the port matches and the bind covers the address."""
+    if listener_port is None or port is None or listener_port != port:
+        return False
+    if listener_ip in (None, "", "0.0.0.0", "::", "*"):
+        return True
+    return str(listener_ip) == str(ip)
+
+
+def _assign_directions(raw_list):
+    """Listener matching: a local listener is inbound when a peer uses it."""
+    listeners = [
+        (raw.get("local_ip"), raw.get("local_port"))
+        for raw in raw_list if raw.get("is_listener")
+    ]
+    directions = []
+    for raw in raw_list:
+        if raw.get("is_listener") or raw.get("remote_ip") is None:
+            directions.append("uncertain")   # refined once observed peers are matched
+            continue
+        if any(_listener_matches(*listener, raw.get("local_ip"), raw.get("local_port"))
+               for listener in listeners):
+            directions.append("inbound")
+        else:
+            directions.append("outbound")
+    return directions
+
+
+def _container_publications(containers, port):
+    """Return the running-container publications that claim a host port."""
+    matches = []
+    if not containers or port is None:
+        return matches
+    for container in containers:
+        if not container.get("running"):
+            continue
+        for key, bindings in (container.get("ports") or {}).items():
+            if not key or "/" not in key:
+                continue
+            container_port, _, proto = key.partition("/")
+            for binding in bindings or []:
+                try:
+                    host_port = int(binding.get("HostPort"))
+                except (TypeError, ValueError):
+                    continue
+                if host_port != port:
+                    continue
+                if proto != "tcp":
+                    continue
+                try:
+                    target_port = int(container_port)
+                except ValueError:
+                    continue
+                matches.append({
+                    "name":      container.get("name"),
+                    "image":     container.get("image"),
+                    "image_id":  container.get("image_id"),
+                    "host_ip":   binding.get("HostIp") or "0.0.0.0",
+                    "host_port": host_port,
+                    "protocol":  "tcp",
+                    "target_port": target_port,
+                    "running":   True,
+                })
+    return matches
+
+
+def _docker_owner_verified(owner):
+    """True only for a socket actually held by the Docker userland proxy."""
+    return _is_docker_proxy_process(owner)
+
+
+def _is_docker_proxy_process(owner):
+    owner = owner or {}
+    return (_basename(owner.get("name")) == "docker-proxy"
+            or _basename(owner.get("exe")) == "docker-proxy"
+            or _basename(owner.get("parent_exe")) in ("dockerd", "docker"))
+
+
+def _classify_otel_listener(raw, bind_scope, containers, docker_status, config, peers):
+    target_port = config.get("otel_target_port") or DEFAULT_OTEL_TARGET_PORT
+    port = raw.get("local_port")
+    expected_name = config.get("otel_container_name")
+    pinned_image = config.get("otel_image_id")
+
+    if docker_status in ("unavailable", "error"):
+        return None, None, (
+            "Listener on port %s looks like a Docker publication, but container identity "
+            "could not be verified (docker status: %s); treated as unverified" % (port, docker_status)
+        )
+    if port != target_port:
+        return None, None, (
+            "Listener on port %s is held by a Docker proxy but the configured collector "
+            "target port is %s" % (port, target_port)
+        )
+
+    publications = _container_publications(containers, port)
+    if len(publications) != 1:
+        return None, None, (
+            "Docker publication proof is %s for host port %s (exactly one running "
+            "container publication is required)" % (
+                "ambiguous" if len(publications) > 1 else "missing", port
+            )
+        )
+    publication = publications[0]
+    if publication.get("target_port") != target_port:
+        return publication, None, (
+            "Container %s publishes host port %s to container port %s, not the "
+            "configured target port %s" % (
+                publication.get("name"), port, publication.get("target_port"), target_port
+            )
+        )
+    if expected_name and publication.get("name") != expected_name:
+        return publication, None, (
+            "Publishing container is named %r, not the configured collector %r" % (
+                publication.get("name"), expected_name
+            )
+        )
+    if not expected_name:
+        return publication, None, (
+            "Publishing container %s is verified, but no collector identity is "
+            "configured (INSTANCE_<N>_SECURITY_OTEL_CONTAINER_NAME, and optionally "
+            "INSTANCE_<N>_SECURITY_OTEL_IMAGE_ID), so the workload cannot be "
+            "confirmed as the expected collector" % publication.get("name")
+        )
+    if pinned_image and pinned_image not in (
+        publication.get("image_id") or "", publication.get("image") or ""
+    ):
+        return publication, None, (
+            "Publishing container image %r does not match the pinned image %r" % (
+                publication.get("image"), pinned_image
+            )
+        )
+    return publication, None, None
+
+
+def _classify_bot_client(raw, owner, config):
+    bot_exe = config.get("bot_exe")
+    bot_script = config.get("bot_script")
+    bot_user = config.get("bot_user")
+    destinations = config.get("bot_https_destinations") or []
+    if not bot_exe or not bot_script:
+        return None, None
+    exe = owner.get("exe") or ""
+    cmdline = [str(arg) for arg in (owner.get("cmdline") or [])]
+    script_match = bot_script in cmdline
+    exe_match = str(exe) == str(bot_exe)
+    user = owner.get("user") or "unknown"
+    user_match = (not bot_user) or str(user) == str(bot_user)
+    if not (exe_match or script_match):
+        return None, None          # unrelated process: judged by the other rules
+    if not (exe_match and script_match and user_match):
+        mismatched = []
+        if not exe_match:
+            mismatched.append("executable %s is not the configured %s" % (exe, bot_exe))
+        if not script_match:
+            mismatched.append("script argument %s is not the configured %s" % (
+                next((arg for arg in cmdline[1:2]), "none"), bot_script))
+        if not user_match:
+            mismatched.append("owner user %s is not the configured %s" % (user, bot_user))
+        return None, (
+            "Process looks like the monitor bot but %s" % "; ".join(mismatched)
+        )
+    if raw.get("remote_port") != BOT_HTTPS_PORT:
+        return None, (
+            "Monitor bot process is connecting to port %s, not the configured "
+            "HTTPS port %s" % (raw.get("remote_port"), BOT_HTTPS_PORT)
+        )
+    if not _is_ephemeral_port(raw.get("local_port")):
+        return None, (
+            "Monitor bot process is using local port %s, which is not an ephemeral "
+            "client port as expected for an outbound client" % raw.get("local_port")
+        )
+    matched = _ip_matches(raw.get("remote_ip"), destinations, raw.get("remote_port"))
+    if not matched:
+        return None, (
+            "Monitor bot process is connecting to %s, which is not one of this "
+            "instance's configured HTTPS destinations" % _endpoint(
+                raw.get("remote_ip"), raw.get("remote_port"))
+        )
+    return matched, None
+
+
+def _classify_tailscale_client(raw, owner, config):
+    tailscaled_exe = config.get("tailscaled_exe")
+    tailscaled_user = config.get("tailscaled_user")
+    destinations = config.get("tailscaled_https_destinations") or []
+    name = _basename(owner.get("name"))
+    exe = owner.get("exe") or "unknown"
+    exe_base = _basename(exe)
+    user = owner.get("user") or "unknown"
+    looks_like_tailscale = "tailscale" in name.lower() or "tailscale" in exe_base.lower()
+    if not tailscaled_exe:
+        if looks_like_tailscale:
+            return None, (
+                "Process %s looks like the Tailscale client, but no "
+                "INSTANCE_<N>_SECURITY_TAILSCALED_EXE is configured to verify it" % name
+            )
+        return None, None
+    if str(exe) != str(tailscaled_exe):
+        if looks_like_tailscale:
+            return None, (
+                "Process %s matches the Tailscale name but its executable %s is not "
+                "the configured %s" % (name, exe, tailscaled_exe)
+            )
+        return None, None
+    if tailscaled_user and str(user) != str(tailscaled_user):
+        return None, (
+            "Tailscale client runs as %s, not the configured %s" % (user, tailscaled_user)
+        )
+    if raw.get("remote_port") != BOT_HTTPS_PORT:
+        return None, (
+            "Tailscale client is connecting to port %s, not its configured "
+            "HTTPS service port %s" % (raw.get("remote_port"), BOT_HTTPS_PORT)
+        )
+    if not _is_ephemeral_port(raw.get("local_port")):
+        return None, (
+            "Tailscale client is using local port %s, which is not an ephemeral "
+            "client port as expected for an outbound client" % raw.get("local_port")
+        )
+    matched = _ip_matches(raw.get("remote_ip"), destinations, raw.get("remote_port"))
+    if not matched:
+        return None, (
+            "Tailscale client is connecting to %s, which is not one of this "
+            "instance's configured Tailscale destinations" % _endpoint(
+                raw.get("remote_ip"), raw.get("remote_port"))
+        )
+    return matched, None
+
+
+def _script_interpreter_owner(owner):
+    """Detect a script run by an interpreter, used for the unknown-script case."""
+    name = _basename(owner.get("name"))
+    exe = _basename(owner.get("exe"))
+    if name not in _SCRIPT_INTERPRETERS and exe not in _SCRIPT_INTERPRETERS:
+        return None
+    cmdline = [str(arg) for arg in (owner.get("cmdline") or [])]
+    script = None
+    for arg in cmdline[1:]:
+        if arg.startswith("-"):
+            continue
+        script = arg
+        break
+    return script
+
+
+def _is_known_service(owner):
+    candidates = {_basename(owner.get("name")), _basename(owner.get("exe")),
+                  _basename(owner.get("parent_exe"))}
+    return bool(candidates & KNOWN_SERVICES)
+
+
+def _classify_observation(raw, direction, bind_scope, containers, docker_status,
+                          config, peers):
+    """Return (observation, adverse_risk_hint) for one collected socket."""
+    owner = raw.get("owner") or _unknown_owner(raw.get("pid"))
+    port = raw.get("local_port")
+    remote_port = raw.get("remote_port")
+    remote_ip = raw.get("remote_ip")
+    listener = bool(raw.get("is_listener"))
+    exposure = bind_scope in ("all-interfaces", "public-interface")
+    base_evidence = {
+        "local": _endpoint(raw.get("local_ip"), port),
+        "remote": _endpoint(remote_ip, remote_port),
+        "state": raw.get("state"),
+        "pid": raw.get("pid"),
+        "owner_exe": owner.get("exe"),
+        "owner_user": owner.get("user"),
+        "peer_connections": len(peers),
+    }
+    identity = _is_known_service(owner) and owner.get("exe") not in (None, "", "unknown")
+
+    if raw.get("protocol") == "unknown" or raw.get("state") in (None, "", "UNKNOWN"):
+        obs = _observation(
+            raw, direction, bind_scope, None, "unknown", "low",
+            "Socket protocol or state could not be determined", base_evidence,
+        )
+        return obs, "unknown"
+
+    # 1. Docker-published collector listener (A / E).
+    if listener and _docker_owner_verified(owner):
+        publication, _, failure = _classify_otel_listener(
+            raw, bind_scope, containers, docker_status, config, peers
+        )
+        if failure:
+            obs = _observation(
+                raw, direction, bind_scope, publication, "needs_review", "low",
+                failure, dict(base_evidence, docker_status=docker_status),
+            )
+            return obs, "review"
+        reasons = [
+            "socket is held by the Docker userland proxy and exactly one running "
+            "container publishes host port %s to container port %s" % (
+                port, publication.get("target_port"))
+        ]
+        if config.get("otel_container_name"):
+            reasons.append("container name matches configured collector %r" %
+                           config.get("otel_container_name"))
+        if config.get("otel_image_id"):
+            reasons.append("container image matches the pinned image")
+        if peers:
+            reasons.append("observed with %d peer connection(s)" % len(peers))
+        if bind_scope != "loopback-only":
+            obs = _observation(
+                raw, direction, bind_scope, publication, "needs_review", "medium",
+                "; ".join(reasons + [
+                    "the host socket is bound to %s rather than loopback, so the "
+                    "collector is reachable from the network" % bind_scope
+                ]),
+                dict(base_evidence, docker_status=docker_status),
+            )
+            return obs, "review"
+        reasons.append("bound to loopback only, so it is not reachable from the network")
+        obs = _observation(
+            raw, direction, bind_scope, publication, "expected", "high",
+            "; ".join(reasons), dict(base_evidence, docker_status=docker_status),
+        )
+        return obs, None
+
+    # 2/3. Configured client services (C / D).
+    if not listener and direction == "outbound":
+        matched, failure = _classify_bot_client(raw, owner, config)
+        if failure:
+            obs = _observation(
+                raw, direction, bind_scope, None, "needs_review", "low",
+                failure, base_evidence,
+            )
+            return obs, "review"
+        if matched:
+            obs = _observation(
+                raw, direction, bind_scope, None, "expected", "high",
+                "Executable, script argument and owner user match the configured "
+                "monitor bot and the destination matches configured entry %r; host "
+                "process identity is not cryptographically attested" % matched,
+                dict(base_evidence, matched_destination=matched),
+            )
+            return obs, None
+        matched, failure = _classify_tailscale_client(raw, owner, config)
+        if failure:
+            obs = _observation(
+                raw, direction, bind_scope, None, "needs_review", "low",
+                failure, base_evidence,
+            )
+            return obs, "review"
+        if matched:
+            obs = _observation(
+                raw, direction, bind_scope, None, "expected", "high",
+                "Executable, owner user and destination match the configured "
+                "Tailscale client and configured destination %r; host process "
+                "identity is not cryptographically attested" % matched,
+                dict(base_evidence, matched_destination=matched),
+            )
+            return obs, None
+
+    # 4. Unknown script talking to a non-HTTPS service (F).
+    if not listener and direction == "outbound" and remote_port not in (None, BOT_HTTPS_PORT):
+        script = _script_interpreter_owner(owner)
+        bot_script = config.get("bot_script")
+        configured = bool(bot_script) and any(
+            str(arg) == str(bot_script) for arg in (owner.get("cmdline") or [])
+        )
+        if script and not configured:
+            obs = _observation(
+                raw, direction, bind_scope, None, "suspicious", "medium",
+                "Unrecognised script %s run by %s is connecting to an unexpected "
+                "service port %s; the destination service is not a configured "
+                "monitor service" % (script, _basename(owner.get("exe")) or
+                                      _basename(owner.get("name")), remote_port),
+                dict(base_evidence, script=script),
+            )
+            return obs, "suspicious"
+
+    # 5. Listeners and matched inbound server-side connections (B / G).
+    if listener or direction == "inbound":
+        if identity:
+            if not listener:
+                # A peer that used a local listener is an accepted server-side
+                # connection, not a listener; peers are not computed for it.
+                reason = ("%s accepted inbound connection %s (state %s) on the local "
+                          "address %s; it is peer traffic against that listener, "
+                          "not a new listener" % (
+                              _basename(owner.get("name")),
+                              _endpoint(remote_ip, remote_port), raw.get("state"),
+                              _endpoint(raw.get("local_ip"), port)))
+            elif exposure:
+                reason = ("%s owns this listener; it is bound to %s, so anyone who "
+                          "can reach the host can reach it" % (
+                              _basename(owner.get("name")), bind_scope))
+            else:
+                reason = ("%s owns this listener bound to %s; %d peer "
+                          "connection(s) observed" % (
+                              _basename(owner.get("name")), bind_scope, len(peers)))
+            obs = _observation(
+                raw, direction, bind_scope, None, "informational", "high",
+                reason + "; no evidence of misuse, but confirm the exposure is intended",
+                base_evidence,
+            )
+            return obs, "exposure" if exposure else None
+        obs = _observation(
+            raw, direction, bind_scope, None, "needs_review",
+            "medium" if identity else "low",
+            ("Listener owner identity could not be established, so this %s listener "
+             "cannot be attributed to a known service" % (
+                 "network reachable" if exposure else "loopback or private-interface"))
+            if listener else
+            ("Accepted inbound connection owner identity could not be established, "
+             "so the peer of the local listener on %s cannot be attributed to a "
+             "known service" % _endpoint(raw.get("local_ip"), port)),
+            base_evidence,
+        )
+        return obs, "review" if exposure else "loopback-review"
+
+    # 6. Everything else outbound stays unresolved rather than presumed benign.
+    obs = _observation(
+        raw, direction, bind_scope, None, "needs_review", "low",
+        "Outbound connection to %s from %s is not matched to any configured "
+        "service destination, so its purpose is unverified" % (
+            _endpoint(remote_ip, remote_port), _basename(owner.get("exe")) or
+            _basename(owner.get("name"))),
+        base_evidence,
+    )
+    return obs, "review"
+
+
+def _assess_network_risk(observations, scan_status, gaps, findings):
+    counts = {name: 0 for name in CLASSIFICATIONS}
+    for obs in observations:
+        counts[obs["classification"]] = counts.get(obs["classification"], 0) + 1
+
+    exposed = [
+        obs for obs in observations
+        if (obs.get("is_listener") or obs["direction"] == "inbound")
+        and obs["classification"] in ("needs_review", "suspicious", "high_risk", "unknown")
+        and obs["bind_scope"] in ("all-interfaces", "public-interface")
+    ]
+    unresolved_outbound = [
+        obs for obs in observations
+        if obs["direction"] == "outbound" and obs["classification"] in
+        ("needs_review", "suspicious", "high_risk", "unknown")
+    ]
+    suspicious = [
+        obs for obs in observations if obs["classification"] in ("suspicious", "high_risk")
+    ]
+
+    level = "negligible"
+    reasons = []
+    if counts["expected"] or counts["informational"] or counts["benign"]:
+        reasons.append(
+            "%d observation(s) matched a verified expected service and %d were "
+            "attributed to a known service" % (
+                counts["expected"], counts["informational"] + counts["benign"])
+        )
+    if exposed:
+        level = "medium"
+        reasons.append(
+            "%d externally exposed or unresolved listener item(s) need review" % len(exposed)
+        )
+    if unresolved_outbound:
+        level = "medium"
+        reasons.append(
+            "%d outbound connection(s) could not be matched to a configured "
+            "service destination" % len(unresolved_outbound)
+        )
+    if suspicious:
+        level = "medium"
+        reasons.append(
+            "%d observation(s) deviate from the configured environment" % len(suspicious)
+        )
+
+    processes = findings.get("processes", {})
+    corroboration = []
+    if processes.get("suspicious_name"):
+        corroboration.append("suspicious process names")
+    if processes.get("suspicious_path"):
+        corroboration.append("processes running from temporary paths")
+    if findings.get("services", {}).get("failed"):
+        corroboration.append("failed system services")
+    if findings.get("auth_log"):
+        corroboration.append("authentication log entries")
+    if any(obs["classification"] == "high_risk" for obs in observations):
+        level = "high"
+        reasons.append("a high risk observation was recorded")
+    elif suspicious and corroboration:
+        level = "high"
+        reasons.append(
+            "deviating network activity is corroborated by %s" % ", ".join(corroboration)
+        )
+
+    posture = "complete" if scan_status == "complete" else (
+        "failed" if scan_status == "failed" else "incomplete"
+    )
+    if posture != "complete":
+        if level in ("negligible", "low"):
+            level = "medium"
+        reasons.append(
+            "evidence is %s (%s); the network posture cannot be cleared" % (
+                posture, "; ".join(str(gap) for gap in gaps)[:200] or "scan status " + str(scan_status))
+        )
+    if findings.get("error"):
+        if level in ("negligible", "low"):
+            level = "medium"
+        reasons.append("scanner reported an error: %s" % findings["error"])
+
+    return {
+        "level":    level,
+        "posture":  posture,
+        "reasons":  reasons,
+        "corroboration": corroboration,
+        "exposed_listener_items": len(exposed),
+        "unresolved_outbound_items": len(unresolved_outbound),
+    }
+
+
+def _finalize_network(findings, raw_list, containers, docker_status, gaps,
+                      config, scan_status="unknown"):
+    """Classify every collected socket and rebuild the legacy projections."""
+    raw_list = [item for item in (raw_list or []) if isinstance(item, dict)]
+    gaps = [str(gap) for gap in (gaps or [])]
+    directions = _assign_directions(raw_list)
+
+    observations = []
+    hints = []
+    for index, raw in enumerate(raw_list):
+        direction = directions[index]
+        peers = [other for other, other_raw in enumerate(raw_list)
+                 if other != index and other_raw.get("is_listener") is False
+                 and directions[other] == "inbound"
+                 and _listener_matches(raw.get("local_ip"), raw.get("local_port"),
+                                       other_raw.get("local_ip"), other_raw.get("local_port"))
+                 ] if raw.get("is_listener") else []
+        if raw.get("is_listener") and peers:
+            direction = "inbound"
+        bind_scope = _bind_scope(raw.get("local_ip"))
+        observation, hint = _classify_observation(
+            raw, direction, bind_scope, containers, docker_status, config, peers
+        )
+        observations.append(observation)
+        hints.append(hint)
+
+    if scan_status in ("failed", "partial", "unknown"):
+        # Identity or lookup failure keeps the evidence but lowers confidence.
+        for observation in observations:
+            observation["confidence"] = {
+                "high": "medium", "medium": "low", "low": "low",
+            }.get(observation["confidence"], "low")
+
+    network = findings.setdefault("network", {})
+    network["observations"] = observations
+    network["category_counts"] = {
+        name: sum(1 for obs in observations if obs["classification"] == name)
+        for name in CLASSIFICATIONS
+    }
+    network["totals"] = {
+        "observations": len(observations),
+        "listeners":    sum(1 for obs in observations if obs["is_listener"]),
+        "inbound":      sum(1 for obs in observations if obs["direction"] == "inbound"),
+        "outbound":     sum(1 for obs in observations if obs["direction"] == "outbound"),
+        "uncertain":    sum(1 for obs in observations if obs["direction"] == "uncertain"),
+    }
+    network["scan_status"] = scan_status
+    network["scan_gaps"] = gaps
+    network["docker_status"] = docker_status
+    network["risk"] = _assess_network_risk(observations, scan_status, gaps, findings)
+    network["adverse_hints"] = hints
+
+    # Legacy compatible projections. They are views over the same evidence: no
+    # owner is invented, inbound server-side sockets are never reported as
+    # external outbound, and nothing is silently truncated.
+    network["unexpected_listening"] = [
+        {
+            "port": obs["local_port"],
+            "addr": _endpoint(obs["local_ip"], obs["local_port"]),
+        }
+        for obs in observations
+        if obs.get("is_listener")
+        and obs["classification"] not in ("expected", "informational", "benign")
+        and obs["local_port"] is not None
+    ]
+    network["external_connections"] = [
+        {
+            "local":  _endpoint(obs["local_ip"], obs["local_port"]),
+            "remote": _endpoint(obs["remote_ip"], obs["remote_port"]),
+        }
+        for obs in observations
+        if obs["direction"] == "outbound" and _is_public(obs.get("remote_ip"))
+    ]
+    return network
+
+
+def _is_private_ip(ip: str) -> bool:
+    """Backwards-compatible helper: True for loopback/private/link-local addresses."""
+    return _is_private(ip) or _is_loopback(ip)
 
 
 def has_any_findings(f: dict) -> bool:
-    """Return True if there is at least one suspicious signal in the findings."""
+    """Return True if there is at least one signal that needs human attention."""
     if f.get("error"):
         return True
     p = f.get("processes", {})
     n = f.get("network", {})
     s = f.get("services", {})
+    network_attention = any(
+        n.get("observations")
+        and obs.get("classification") in ("needs_review", "suspicious", "high_risk", "unknown")
+        for obs in n.get("observations", [])
+    ) or n.get("scan_status") not in (None, "complete") or bool(n.get("scan_gaps"))
     return bool(
         p.get("high_cpu")
         or p.get("high_mem")
@@ -418,4 +1425,5 @@ def has_any_findings(f: dict) -> bool:
         or n.get("external_connections")
         or s.get("failed")
         or f.get("auth_log")
+        or network_attention
     )

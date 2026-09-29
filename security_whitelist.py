@@ -3,11 +3,18 @@ security_whitelist.py
 ─────────────────────
 Configuration file for whitelisting known-safe IPs, ports, and other security exceptions.
 Edit this file to add your own trusted items.
+
+Scope note: SAFE_PORTS, SAFE_EXTERNAL_IPS, SAFE_LOCALHOST_ADDRS,
+ALLOW_NORMAL_HTTPS_OUTBOUND and MAX_NORMAL_HTTPS_CONNECTIONS are retained for
+backwards compatibility only. The security scanner no longer uses them to
+preclassify, suppress, or bound network observations, because a port number or
+an address is not proof of identity. Network classification now depends on the
+per-instance INSTANCE_<N>_SECURITY_* identity settings documented in README.md.
 """
 
 # ─── SAFE IPs ─────────────────────────────────────────────
+# Retained for backwards compatibility; no longer suppresses network evidence.
 # Add your known-safe external IP addresses here (your office, home, etc.)
-# These IPs won't be flagged as suspicious in external connections
 SAFE_EXTERNAL_IPS = {
     "121.58.203.121",  # Your SSH connection
     # Add more IPs as needed:
@@ -16,6 +23,7 @@ SAFE_EXTERNAL_IPS = {
 }
 
 # ─── SAFE PORTS ──────────────────────────────────────────
+# Retained for backwards compatibility; no longer suppresses network evidence.
 # Ports that are known to be safe for listening
 SAFE_PORTS = {
     22,      # SSH
