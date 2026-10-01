@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import namedtuple
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -236,34 +237,76 @@ def load_private_key(key_path):
 
 # ─── SSH RUNNER ───────────────────────────────────────────
 
-def ssh_run(inst, cmd):
+# What one SSH command produced, including the evidence ssh_run has always thrown
+# away. A namedtuple (not a bare tuple) so a caller can read `result.stderr` by
+# name, and it is duck-typed on that attribute by the security collector, so a
+# plain str-or-None runner stays equally acceptable there.
+SSHResult = namedtuple("SSHResult", ("stdout", "stderr", "exit_status", "unreachable"))
+
+
+def _ssh_run_once(inst, cmd):
+    """
+    Run one SSH command and return its SSHResult. One connection, one round trip.
+
+    This is the whole of what both runners do; ssh_run and ssh_run_detailed are
+    two views of it, so neither can acquire a second connection or a second
+    command, and a change to one cannot drift from the other.
+    """
+    key    = load_private_key(inst["key"])
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(inst["ip"], username=inst["ssh_user"], pkey=key, timeout=10)
     try:
-        key    = load_private_key(inst["key"])
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(inst["ip"], username=inst["ssh_user"], pkey=key, timeout=10)
         _, stdout, stderr = client.exec_command(cmd)
         output = stdout.read().decode().strip()
         error  = stderr.read().decode().strip()
+        try:
+            # The channel's own status, when the transport still has it. Absent
+            # here only if the connection dropped before it arrived.
+            status = stdout.channel.recv_exit_status()
+        except Exception:
+            status = None
+    finally:
         client.close()
-        if error:
-            print(f"[WARN] stderr from {inst['ip']}: {error}")
-        return output
+    return SSHResult(output, error, status, False)
+
+
+def ssh_run_detailed(inst, cmd):
+    """
+    ssh_run's result plus the stderr and SSH exit status it discards.
+
+    Additive and backwards compatible: the connection, the single round trip and
+    the failure-to-None contract are exactly ssh_run's, so no existing caller's
+    behaviour or traffic changes. It exists because a remote interpreter that
+    dies before printing its payload leaves stdout empty and stdout cannot say
+    why — the stderr and exit status are what make that failure diagnosable.
+    """
+    try:
+        result = _ssh_run_once(inst, cmd)
     except paramiko.AuthenticationException:
         print(f"[ERROR] Auth failed for {inst['ip']} (user: {inst['ssh_user']})")
-        return None
+        return SSHResult(None, "", None, True)
     except paramiko.SSHException as e:
         print(f"[ERROR] SSH error for {inst['ip']}: {e}")
-        return None
+        return SSHResult(None, "", None, True)
     except FileNotFoundError:
         print(f"[ERROR] Key file not found: {inst['key']}")
-        return None
+        return SSHResult(None, "", None, True)
     except ValueError as e:
         print(f"[ERROR] {e}")
-        return None
+        return SSHResult(None, "", None, True)
     except Exception as e:
         print(f"[ERROR] Could not connect to {inst['ip']}: {e}")
-        return None
+        return SSHResult(None, "", None, True)
+    if result.stderr:
+        print(f"[WARN] stderr from {inst['ip']}: {result.stderr}")
+    return result
+
+
+def ssh_run(inst, cmd):
+    """stdout on success, None on any failure. One connection, one round trip."""
+    return ssh_run_detailed(inst, cmd).stdout
+
 
 # ─── METRICS ──────────────────────────────────────────────
 
@@ -808,7 +851,11 @@ def _collect_security_findings(inst):
     if inst["is_local"]:
         return collect_local(inst["name"], inst.get("security"))
     if inst.get("is_windows"):
-        return collect_remote_windows(inst, ssh_run, inst.get("security"))
+        # The detailed runner, and only here: a Windows host that never ran the
+        # command returns empty stdout, and stdout alone cannot say whether the
+        # command line was too long, the interpreter was missing or the program
+        # raised. Linux keeps the plain runner — that path is not being repaired.
+        return collect_remote_windows(inst, ssh_run_detailed, inst.get("security"))
     return collect_remote_linux(inst, ssh_run, inst.get("security"))
 
 

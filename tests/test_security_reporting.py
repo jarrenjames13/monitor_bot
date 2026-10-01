@@ -1297,9 +1297,21 @@ class RegDispatchTests(unittest.TestCase):
         not_chosen = ("collect_remote_windows" if real_name == "collect_remote_linux"
                       else "collect_remote_linux")
 
-        def runner(target, command):
+        # BOTH runners are stubbed so the dispatcher cannot reach a real SSH
+        # connection. Which runner the collector under test was actually handed is
+        # observed, not assumed: the caller asserts it, so the stubbing can never
+        # decide the answer itself.
+        observed = []
+
+        def record(target, command):
             commands.append(command)
+            observed.append("plain")
             return None
+
+        def detailed(target, command):
+            commands.append(command)
+            observed.append("detailed")
+            return monitor.SSHResult("", "", None, False)
 
         chosen = mock.Mock(side_effect=real)
         mocks = {
@@ -1308,7 +1320,8 @@ class RegDispatchTests(unittest.TestCase):
             "collect_remote_windows": mock.Mock(),
         }
         with (
-            mock.patch.object(monitor, "ssh_run", runner),
+            mock.patch.object(monitor, "ssh_run", record),
+            mock.patch.object(monitor, "ssh_run_detailed", detailed),
             mock.patch.object(monitor, "collect_local", mocks["local"]),
             mock.patch.object(monitor, "collect_remote_linux",
                               mocks["collect_remote_linux"]),
@@ -1317,17 +1330,26 @@ class RegDispatchTests(unittest.TestCase):
             mock.patch.object(monitor, real_name, chosen),
         ):
             monitor._collect_security_findings(inst)
+        # Exactly one SSH call was made, by the collector under test, through one
+        # of the two runners: `observed` records which, so the caller can assert
+        # the dispatch decision instead of assuming it.
         # The "must not be called" assertions read the mock for that OTHER
         # attribute, so none of them is satisfied by a shadowed mock.
-        return commands, mocks["local"], mocks[not_chosen], chosen, runner
+        return (commands, mocks["local"], mocks[not_chosen], chosen,
+                tuple(observed), (record, detailed))
 
     def test_reg_07_a_windows_instance_uses_the_windows_collector_only(self):
         """REG-07: is_windows never reaches the Linux program or command."""
-        commands, local, other, chosen, runner = self.dispatch(
+        commands, local, other, chosen, observed, runners = self.dispatch(
             self.WINDOWS, "collect_remote_windows")
+        plain, detailed = runners
 
         self.assertEqual(chosen.call_count, 1)
-        chosen.assert_called_once_with(self.WINDOWS, runner, self.WINDOWS["security"])
+        chosen.assert_called_once_with(self.WINDOWS, detailed, self.WINDOWS["security"])
+        # The Windows path is the one that gets the DETAILED runner, so it can
+        # diagnose an empty response. This is the load-bearing half of the dispatch
+        # decision, so it is asserted rather than assumed by the stubbing.
+        self.assertEqual(observed, ("detailed",))
         self.assertEqual(other.call_count, 0)
         self.assertEqual(local.call_count, 0)
         # The command the real Windows collector sent over SSH:
@@ -1342,10 +1364,14 @@ class RegDispatchTests(unittest.TestCase):
 
     def test_reg_08_a_linux_remote_instance_still_uses_the_linux_collector(self):
         """REG-08 (preservation guard): the Linux path is byte-for-byte unchanged."""
-        commands, local, other, chosen, _runner = self.dispatch(
+        commands, local, other, chosen, observed, runners = self.dispatch(
             self.LINUX, "collect_remote_linux")
+        plain, _detailed = runners
 
         self.assertEqual(chosen.call_count, 1)
+        # The Linux path keeps the PLAIN runner: it is not the path being repaired,
+        # so it must not acquire the detailed runner's stderr handling.
+        self.assertEqual(observed, ("plain",))
         self.assertEqual(other.call_count, 0)
         self.assertEqual(local.call_count, 0)
         self.assertEqual(len(commands), 1)
@@ -1750,9 +1776,16 @@ class RegScanGuardTests(unittest.TestCase):
 
 
 def _decoded(command):
-    """The base64 program a generated command carries, or ''."""
-    match = re.search(r"b64decode\('([A-Za-z0-9+/=]+)'\)", command)
-    return base64.b64decode(match.group(1)).decode("utf-8") if match else ""
+    """
+    The Python program a generated security command carries, or ''.
+
+    Delegates to the single decoder the scanner tests use, so the Windows
+    (gzip-compressed) and Linux (plain base64) forms are read the same way in
+    both modules and cannot drift.
+    """
+    from tests.test_security_scanner import decode_remote_program
+
+    return decode_remote_program(command)
 
 
 def _async(value):

@@ -8,9 +8,11 @@ Called by the scheduled 11 PM job and by the /security command.
 """
 
 import base64
+import gzip
 import ipaddress
 import json
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -545,10 +547,13 @@ def _build_remote_command():
 # __AURORA_SECURITY_EXIT__ trailer. That trailer is a SUCCESS MARKER: the program
 # always prints 0 once it has produced a payload. A partial or failed collection is
 # carried by the payload itself, never by the trailer — `scan_status: "partial"`
-# plus the gaps that name each unavailable category — and an SSH loss or an
-# unparsable/missing payload is reported by collect_remote_windows as a FAILED scan
-# via _fail_scan. A nonzero trailer therefore only ever arrives from a host running
-# something other than this program.
+# plus the gaps that name each unavailable category — and an SSH loss, an empty
+# response or an unparsable/missing payload is reported by collect_remote_windows as
+# a FAILED scan via _fail_scan. A nonzero trailer therefore only ever arrives from a
+# host running something other than this program. The Windows path additionally
+# reads the SSH exit status and stderr (see _runner_outcome), which is why a remote
+# that never ran this program is now reported as NO OUTPUT instead of as a response
+# that merely lost its trailer.
 _REMOTE_SCRIPT_WINDOWS = r'''import json, os, socket, subprocess
 from datetime import datetime
 import psutil
@@ -724,11 +729,29 @@ def _build_remote_command_windows():
     """
     The Windows SSH command: static text, one interpreter, no shell syntax.
 
-    There is no `; exit "$rc"` here because monitor.ssh_run returns stdout only
-    and throws the SSH exit status away, so the program prints its own trailer.
+    The program travels GZIP-COMPRESSED and then base64-encoded. Plain base64 of
+    the 9,427-byte program produced a 12,624-character command, far beyond
+    cmd.exe's 8,191-character command-line limit, so Windows truncated the
+    command mid-base64 and the shell ran nothing at all. Compressed, the same
+    program is a 4,520-character payload in a 4,594-character command, and
+    decompressing it yields _REMOTE_SCRIPT_WINDOWS byte for byte.
+
+    mtime=0 is required so the command is byte-deterministic across runs and a
+    regression can pin it exactly; without it the gzip header would embed the
+    build time. base64 and gzip are Python stdlib only, so the Windows host needs
+    nothing beyond the interpreter it already runs.
+
+    There is no `; exit "$rc"` here because the program prints its own trailer:
+    the trailer is this program's success marker, so it does not depend on the
+    SSH exit status, which a shell-quoted continuation would make unreliable.
     """
-    encoded = base64.b64encode(_REMOTE_SCRIPT_WINDOWS.encode("utf-8")).decode("ascii")
-    return "python -c \"exec(__import__('base64').b64decode('" + encoded + "'))\""
+    payload = base64.b64encode(
+        gzip.compress(_REMOTE_SCRIPT_WINDOWS.encode("utf-8"), 9, mtime=0)
+    ).decode("ascii")
+    return (
+        "python -c \"import base64,gzip;exec(gzip.decompress(base64.b64decode('"
+        + payload + "')))\""
+    )
 
 
 # Kept as a module-level name for callers/tests that referenced the old constant.
@@ -811,6 +834,100 @@ def collect_remote_linux(inst: dict, ssh_run_fn, security_config: dict | None = 
 collect_remote = collect_remote_linux
 
 
+# ─── REMOTE FAILURE DIAGNOSTICS ────────────────────────────
+# A remote interpreter that dies before printing its payload (a missing module, a
+# syntax error, a command line cmd.exe truncated) leaves stdout empty, and stdout
+# alone cannot say why. These patterns reduce that stderr to a short, inert
+# fragment safe to show an operator: no key material, no token, no environment
+# assignment, no absolute path, no username and no hostname ever reaches the
+# report, and the fragment is capped so it cannot crowd out the evidence.
+_REMOTE_DIAGNOSTIC_CAP = 240
+
+_REMOTE_DIAGNOSTIC_RULES = (
+    # Private key blocks, in full or truncated, are removed before anything else
+    # can mistake the body for a path or a bare token.
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
+                re.DOTALL), "<key material removed>"),
+    # Environment assignments: NAME=value with a credential-looking or long value.
+    (re.compile(r"(?i)\b([A-Za-z_][A-Za-z0-9_]*(?:key|token|secret|password|passwd|"
+                r"credential|auth)[A-Za-z0-9_]*)\s*=\s*\S+"), r"\1=[redacted]"),
+    (re.compile(r"(?i)\b(token|password|passwd|secret|api[_-]?key|access[_-]?key)\b"
+                r"\s*[:=]\s*\S+"), r"\1=[redacted]"),
+    # Windows paths (drive-letter and UNC) and POSIX paths.
+    (re.compile(r"[A-Za-z]:\\[^\s'\"]*"), "<path>"),
+    (re.compile(r"\\\\[^\s'\"\\]+\\[^\s'\"]*"), "<path>"),
+    (re.compile(r"(?:/[\w.-]+){2,}/?"), "<path>"),
+    # Usernames in the shapes an SSH or Python error actually uses.
+    (re.compile(r"(?i)\b(user|username|login|account)\b\s*[:=]\s*['\"]?[\w.\\/-]+"),
+     r"\1=[redacted]"),
+    (re.compile(r"(?i)\b(user|username|login|account)\b\s+['\"]?[\w.\\/-]+"),
+     r"\1 [redacted]"),
+    (re.compile(r"(?i)\bfor\s+user\b\s*['\"]?[\w.\\/-]+"), "for user [redacted]"),
+    # Hostnames and addresses: IPv4 first, then IPv6, then dotted names.
+    (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"), "<host>"),
+    (re.compile(r"\b(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b"), "<host>"),
+    (re.compile(r"\b[\w-]{2,}(?:\.[\w-]{2,})+(?::\d+)?\b"), "<host>"),
+    # Anything left that is long and unbroken is an opaque blob (a token or an
+    # encoded command), not something to echo into a chat message.
+    (re.compile(r"\b[A-Za-z0-9+/=_-]{32,}\b"), "<blob removed>"),
+)
+
+
+def sanitize_remote_diagnostic(text, cap: int = _REMOTE_DIAGNOSTIC_CAP) -> str:
+    """
+    Reduce remote stderr (and a remote exit status) to a short inert fragment.
+
+    Empty or non-string input returns "", so a caller can always append the
+    result unconditionally and a silent remote stays silent. Every rule removes
+    rather than quotes, the result is whitespace-collapsed and truncated to
+    `cap` characters, and nothing here can raise a scan out of failed.
+    """
+    if not text:
+        return ""
+    fragment = " ".join(str(text).split())
+    if not fragment:
+        return ""
+    for pattern, replacement in _REMOTE_DIAGNOSTIC_RULES:
+        fragment = pattern.sub(replacement, fragment)
+    return fragment[:cap].strip()
+
+
+def _runner_outcome(ssh_run_fn, inst: dict, command: str) -> dict:
+    """
+    Run one SSH command and return its stdout plus any diagnostic extras.
+
+    The runner may be the plain stdout-or-None runner the other callers use, or
+    a detailed runner (monitor.ssh_run_detailed) that also carries stderr and the
+    remote exit status. The shape is detected, not assumed, so a plain runner
+    degrades to the pre-existing behaviour with no diagnostic at all rather than
+    failing: `ssh_run_fn` itself is called exactly once either way, so this adds
+    no SSH connection and no round trip.
+
+    `reason` is a sanitized, capped fragment for the failure message, and is
+    empty when the remote said nothing.
+    """
+    result = ssh_run_fn(inst, command)
+    outcome = {"stdout": result, "stderr": "", "exit_status": None,
+               "remote_nonzero": False, "reason": ""}
+    # A detailed result is an object carrying stdout; a plain result IS stdout.
+    if hasattr(result, "stdout"):
+        outcome["stdout"] = result.stdout
+        outcome["stderr"] = getattr(result, "stderr", "") or ""
+        outcome["exit_status"] = getattr(result, "exit_status", None)
+    exit_status = outcome["exit_status"]
+    outcome["remote_nonzero"] = exit_status is not None and str(exit_status) != "0"
+
+    diagnostic = sanitize_remote_diagnostic(outcome["stderr"])
+    if outcome["remote_nonzero"]:
+        # The status is folded in and the WHOLE reason is capped once, here, so no
+        # prefix can push the fragment past the cap.
+        status = sanitize_remote_diagnostic(exit_status, cap=16)
+        diagnostic = f"remote exit status {status}: {diagnostic}" if diagnostic \
+            else f"remote exit status {status}"
+    outcome["reason"] = diagnostic[:_REMOTE_DIAGNOSTIC_CAP].strip()
+    return outcome
+
+
 def collect_remote_windows(inst: dict, ssh_run_fn, security_config: dict | None = None) -> dict:
     """
     Gather structured evidence from a remote Windows instance via SSH.
@@ -820,25 +937,55 @@ def collect_remote_windows(inst: dict, ssh_run_fn, security_config: dict | None 
     central policy. Categories this collector cannot reach on Windows are
     reported as unavailable, which forces an incomplete posture rather than a
     clean one.
+
+    `ssh_run_fn` may be either the plain stdout-or-None runner the other callers
+    use or a detailed runner (monitor.ssh_run_detailed) that also carries stderr
+    and the remote exit status. That extra evidence is diagnostic only: it never
+    turns a failure into a pass and never enters the classification policy.
+
+    Failure modes stay distinguishable, in this order: SSH loss, then NO OUTPUT
+    at all, then a missing/nonzero trailer, then an unparsable payload. An empty
+    response is reported in its own words because it is what a Windows host
+    returns when the command line it was given never ran (for instance a command
+    too long for cmd.exe) — a transport failure, not a protocol failure — and it
+    must not be mistaken for a host that merely forgot its trailer.
     """
     findings = _base_findings(inst["name"], "remote")
-    output = ssh_run_fn(inst, _build_remote_command_windows())
+    outcome = _runner_outcome(ssh_run_fn, inst, _build_remote_command_windows())
 
-    if output is None:
+    if outcome["stdout"] is None:
         _fail_scan(findings, "SSH unreachable", security_config)
         return findings
 
-    response = str(output)
+    response = str(outcome["stdout"])
+
+    # NO OUTPUT is its own failure, checked BEFORE the trailer: an empty
+    # response has no exit status to be missing, and folding the two together
+    # is what made a truncated command indistinguishable from a protocol bug.
+    if not response.strip():
+        message = "Remote security scanner produced no output"
+        if outcome["reason"]:
+            message += ": " + outcome["reason"]
+        _fail_scan(findings, message, security_config)
+        return findings
+
     exit_code = None
     if _EXIT_TRAILER in response:
         response, _, trailer = response.rpartition(_EXIT_TRAILER)
         exit_code = trailer.strip().splitlines()[0].strip() if trailer.strip() else ""
-    if exit_code != "0":
+    # A remote exit status of its own is authoritative alongside the trailer: the
+    # Windows program prints its trailer only after it has produced a payload, so
+    # a nonzero status means the interpreter itself failed and the payload — if
+    # any — cannot be trusted. It fails, and it fails even when the trailer says 0.
+    remote_failed = outcome["remote_nonzero"]
+    if exit_code != "0" or remote_failed:
         message = (
             "Remote security scanner exited nonzero"
-            if exit_code
+            if exit_code or remote_failed
             else "Remote security scanner response is missing its exit status"
         )
+        if outcome["reason"]:
+            message += ": " + outcome["reason"]
         remote_data = _parse_remote_payload(response)
         if remote_data is None:
             _fail_scan(findings, message, security_config)

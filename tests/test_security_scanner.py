@@ -10,6 +10,7 @@ generated remote command is safe and parseable by a POSIX shell.
 """
 
 import base64
+import gzip
 import io
 import json
 import os
@@ -1137,11 +1138,28 @@ LINUX_ONLY_TOKENS = (
 WINDOWS_PAYLOAD_KEYS = ("docker_containers", "docker_status")
 
 
+def decode_remote_program(command, default=""):
+    """
+    The Python program a generated security command carries, or `default`.
+
+    One implementation for every decoder in both security test modules, so the
+    Windows (gzip-compressed) and Linux (plain base64) forms cannot drift into
+    two subtly different readings of the same command. The form is decided by
+    the command text itself, not by the caller's expectation of it.
+    """
+    match = re.search(r"b64decode\('([A-Za-z0-9+/=]+)'\)", command)
+    if match is None:
+        return default
+    raw = base64.b64decode(match.group(1))
+    return gzip.decompress(raw).decode("utf-8") if "gzip.decompress(" in command \
+        else raw.decode("utf-8")
+
+
 def _windows_program():
-    match = re.search(r"b64decode\('([A-Za-z0-9+/=]+)'\)",
-                      security_scanner._build_remote_command_windows())
-    assert match is not None, "the Windows command carries no base64 program"
-    return base64.b64decode(match.group(1)).decode("utf-8")
+    program = decode_remote_program(
+        security_scanner._build_remote_command_windows())
+    assert program, "the Windows command carries no base64 program"
+    return program
 
 
 def _strip_windows_payload_keys(program):
@@ -1169,6 +1187,209 @@ def _run_windows_program(sockets, processes, users=()):
     body, marker, trailer = raw.rpartition("\n__AURORA_SECURITY_EXIT__=")
     assert marker == "\n__AURORA_SECURITY_EXIT__=", "the trailer format changed"
     return raw, json.loads(body), trailer.strip()
+
+
+# cmd.exe refuses a command line longer than this. It is the whole reason the
+# Windows transport is compressed at all, so the test that guards the transport
+# pins the number rather than trusting it to stay remembered.
+WINDOWS_COMMAND_LIMIT = 8191
+
+# Captured from `_build_remote_command()` at HEAD f9d1c2d2 and pinned verbatim.
+# It is the Linux transport's own value, so a Windows-transport change cannot
+# recompute it from the code it is supposed to be checking: `_REMOTE_SCRIPT` and
+# `_build_remote_command()` must stay byte-identical, ending `exit "$rc"`.
+PINNED_LINUX_COMMAND = (
+    'python3 -c "import base64;exec(base64.b64decode(\''
+    'aW1wb3J0IGpzb24sIG9zLCBzb2NrZXQsIHN1YnByb2Nlc3MKZnJvbSBkYXRldGltZSBpbXBvcnQgZGF0ZXRpbWUKaW1w'
+    'b3J0IHBzdXRpbAoKU1VTUF9OQU1FUyA9IHsnbmMnLCduZXRjYXQnLCduY2F0Jywnbm1hcCcsJ21hc3NjYW4nLCdzb2Nh'
+    'dCcsJ3htcmlnJywnY2dtaW5lcicsJ21pbmVyZCcsJ2V0aG1pbmVyJywnbXNmY29uc29sZScsJ2h5ZHJhJywnc3FsbWFw'
+    'Jywnam9obicsJ2hhc2hjYXQnLCdtaW1pa2F0eid9ClNVU1BfUEFUSFMgPSBbJy90bXAvJywnL2Rldi9zaG0vJywnL3Zh'
+    'ci90bXAvJywnL3J1bi9zaG0vJ10KU0FGRV9aT01CSUVTID0geydjaHJvbWUnLCdjaHJvbWl1bScsJ25vZGUnLCdweXRo'
+    'b24nfQoKZmluZGluZ3MgPSB7CiAgICAncHJvY2Vzc2VzJzogeydoaWdoX2NwdSc6IFtdLCAnaGlnaF9tZW0nOiBbXSwg'
+    'J3N1c3BpY2lvdXNfbmFtZSc6IFtdLCAnc3VzcGljaW91c19wYXRoJzogW10sICd6b21iaWVzJzogW119LAogICAgJ25l'
+    'dHdvcmsnOiB7J3Jhd19vYnNlcnZhdGlvbnMnOiBbXSwgJ2RvY2tlcl9jb250YWluZXJzJzogW10sICdkb2NrZXJfc3Rh'
+    'dHVzJzogJ25vdF9yZXF1aXJlZCcsCiAgICAgICAgICAgICAgICAnc2Nhbl9zdGF0dXMnOiAnY29tcGxldGUnLCAnc2Nh'
+    'bl9nYXBzJzogW119LAogICAgJ3VzZXJzJzogeydsb2dnZWRfaW4nOiBbXX0sCiAgICAnZmlsZXMnOiB7J3JlY2VudGx5'
+    'X21vZGlmaWVkX3N5c3RlbSc6IFtdfSwKICAgICdzZXJ2aWNlcyc6IHsnZmFpbGVkJzogW10sICduZXdfdW5pdHMnOiBb'
+    'XX0sCiAgICAnY3Jvbic6IHsnZW50cmllcyc6IFtdfSwKICAgICdhdXRoX2xvZyc6IFtdLAp9CgpkZWYgX2Jhc2VfbmFt'
+    'ZShwYXRoKToKICAgIHJldHVybiBvcy5wYXRoLmJhc2VuYW1lKHN0cihwYXRoIG9yICcnKS5yc3RyaXAoJy8nKSkgaWYg'
+    'cGF0aCBlbHNlICcnCgpkZWYgX2RvY2tlcl9wcm94eShvd25lcik6CiAgICBvd25lciA9IG93bmVyIG9yIHt9CiAgICBy'
+    'ZXR1cm4gKF9iYXNlX25hbWUob3duZXIuZ2V0KCduYW1lJykpID09ICdkb2NrZXItcHJveHknCiAgICAgICAgICAgIG9y'
+    'IF9iYXNlX25hbWUob3duZXIuZ2V0KCdleGUnKSkgPT0gJ2RvY2tlci1wcm94eScKICAgICAgICAgICAgb3IgX2Jhc2Vf'
+    'bmFtZShvd25lci5nZXQoJ3BhcmVudF9leGUnKSkgaW4gKCdkb2NrZXJkJywgJ2RvY2tlcicpKQoKZGVmIHJ1bihjbWQp'
+    'OgogICAgdHJ5OgogICAgICAgIHJlc3VsdCA9IHN1YnByb2Nlc3MucnVuKGNtZCwgc2hlbGw9VHJ1ZSwgY2FwdHVyZV9v'
+    'dXRwdXQ9VHJ1ZSwgdGV4dD1UcnVlLCB0aW1lb3V0PTEwKQogICAgICAgIHJldHVybiByZXN1bHQuc3Rkb3V0LnN0cmlw'
+    'KCkKICAgIGV4Y2VwdCBFeGNlcHRpb246CiAgICAgICAgcmV0dXJuICcnCgpwcm9jZXNzX21hcCA9IHt9CnRyeToKICAg'
+    'IGZvciBwcm9jZXNzIGluIHBzdXRpbC5wcm9jZXNzX2l0ZXIoWydwaWQnLCdwcGlkJywnbmFtZScsJ2V4ZScsJ2NtZGxp'
+    'bmUnLCd1c2VybmFtZScsJ2NwdV9wZXJjZW50JywnbWVtb3J5X3BlcmNlbnQnLCdzdGF0dXMnXSk6CiAgICAgICAgdHJ5'
+    'OgogICAgICAgICAgICBpID0gcHJvY2Vzcy5pbmZvCiAgICAgICAgICAgIHBpZCA9IGkuZ2V0KCdwaWQnKQogICAgICAg'
+    'ICAgICBuYW1lID0gaS5nZXQoJ25hbWUnKSBvciAnJwogICAgICAgICAgICBleGUgPSBpLmdldCgnZXhlJykgb3IgJycK'
+    'ICAgICAgICAgICAgdXNlciA9IGkuZ2V0KCd1c2VybmFtZScpIG9yICcnCiAgICAgICAgICAgIHByb2Nlc3NfbWFwW3Bp'
+    'ZF0gPSB7J3BpZCc6IHBpZCwgJ3BwaWQnOiBpLmdldCgncHBpZCcpLCAnbmFtZSc6IG5hbWUgb3IgJ3Vua25vd24nLAog'
+    'ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICdleGUnOiBleGUgb3IgJ3Vua25vd24nLCAnY21kbGluZSc6IGku'
+    'Z2V0KCdjbWRsaW5lJykgb3IgW10sCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgJ3VzZXInOiB1c2VyIG9y'
+    'ICd1bmtub3duJywgJ3BhcmVudF9leGUnOiAndW5rbm93bid9CiAgICAgICAgICAgIGNwdSA9IGkuZ2V0KCdjcHVfcGVy'
+    'Y2VudCcpIG9yIDAKICAgICAgICAgICAgbWVtID0gaS5nZXQoJ21lbW9yeV9wZXJjZW50Jykgb3IgMAogICAgICAgICAg'
+    'ICBpZiAoaS5nZXQoJ3N0YXR1cycpIG9yICcnKSA9PSAnem9tYmllJyBhbmQgbm90IGFueSh6IGluIG5hbWUubG93ZXIo'
+    'KSBmb3IgeiBpbiBTQUZFX1pPTUJJRVMpOgogICAgICAgICAgICAgICAgZmluZGluZ3NbJ3Byb2Nlc3NlcyddWyd6b21i'
+    'aWVzJ10uYXBwZW5kKHsncGlkJzogcGlkLCAnbmFtZSc6IG5hbWV9KQogICAgICAgICAgICBpZiBjcHUgPj0gNTA6CiAg'
+    'ICAgICAgICAgICAgICBmaW5kaW5nc1sncHJvY2Vzc2VzJ11bJ2hpZ2hfY3B1J10uYXBwZW5kKHsncGlkJzogcGlkLCAn'
+    'bmFtZSc6IG5hbWUsICdjcHUnOiByb3VuZChjcHUsIDEpLCAndXNlcic6IHVzZXIsICdleGUnOiBleGV9KQogICAgICAg'
+    'ICAgICBpZiBtZW0gPj0gMzA6CiAgICAgICAgICAgICAgICBmaW5kaW5nc1sncHJvY2Vzc2VzJ11bJ2hpZ2hfbWVtJ10u'
+    'YXBwZW5kKHsncGlkJzogcGlkLCAnbmFtZSc6IG5hbWUsICdtZW0nOiByb3VuZChtZW0sIDEpLCAndXNlcic6IHVzZXIs'
+    'ICdleGUnOiBleGV9KQogICAgICAgICAgICBpZiBuYW1lLmxvd2VyKCkgaW4gU1VTUF9OQU1FUzoKICAgICAgICAgICAg'
+    'ICAgIGZpbmRpbmdzWydwcm9jZXNzZXMnXVsnc3VzcGljaW91c19uYW1lJ10uYXBwZW5kKHsncGlkJzogcGlkLCAnbmFt'
+    'ZSc6IG5hbWUsICdleGUnOiBleGUsICd1c2VyJzogdXNlcn0pCiAgICAgICAgICAgIGlmIGV4ZSBhbmQgYW55KGV4ZS5z'
+    'dGFydHN3aXRoKHBhdGgpIGZvciBwYXRoIGluIFNVU1BfUEFUSFMpOgogICAgICAgICAgICAgICAgZmluZGluZ3NbJ3By'
+    'b2Nlc3NlcyddWydzdXNwaWNpb3VzX3BhdGgnXS5hcHBlbmQoeydwaWQnOiBwaWQsICduYW1lJzogbmFtZSwgJ2V4ZSc6'
+    'IGV4ZSwgJ3VzZXInOiB1c2VyfSkKICAgICAgICBleGNlcHQgKHBzdXRpbC5Ob1N1Y2hQcm9jZXNzLCBwc3V0aWwuQWNj'
+    'ZXNzRGVuaWVkKToKICAgICAgICAgICAgZmluZGluZ3NbJ25ldHdvcmsnXVsnc2Nhbl9nYXBzJ10uYXBwZW5kKCdTb21l'
+    'IHByb2Nlc3MgaWRlbnRpdHkgZmllbGRzIHdlcmUgaW5hY2Nlc3NpYmxlJykKICAgICAgICBleGNlcHQgRXhjZXB0aW9u'
+    'IGFzIGV4YzoKICAgICAgICAgICAgZmluZGluZ3NbJ25ldHdvcmsnXVsnc2Nhbl9nYXBzJ10uYXBwZW5kKCdQcm9jZXNz'
+    'IGlkZW50aXR5IGxvb2t1cCBmYWlsZWQ6ICcgKyB0eXBlKGV4YykuX19uYW1lX18pCmV4Y2VwdCBFeGNlcHRpb24gYXMg'
+    'ZXhjOgogICAgZmluZGluZ3NbJ25ldHdvcmsnXVsnc2Nhbl9nYXBzJ10uYXBwZW5kKCdQcm9jZXNzIGVudW1lcmF0aW9u'
+    'IGZhaWxlZDogJyArIHR5cGUoZXhjKS5fX25hbWVfXyArICc6ICcgKyBzdHIoZXhjKSkKZm9yIG93bmVyIGluIHByb2Nl'
+    'c3NfbWFwLnZhbHVlcygpOgogICAgcGFyZW50ID0gcHJvY2Vzc19tYXAuZ2V0KG93bmVyLmdldCgncHBpZCcpKQogICAg'
+    'aWYgcGFyZW50OgogICAgICAgIG93bmVyWydwYXJlbnRfZXhlJ10gPSBwYXJlbnQuZ2V0KCdleGUnKSBvciAndW5rbm93'
+    'bicKCnRyeToKICAgIGNvbm5lY3Rpb25zID0gcHN1dGlsLm5ldF9jb25uZWN0aW9ucyhraW5kPSdpbmV0JykKZXhjZXB0'
+    'IEV4Y2VwdGlvbiBhcyBleGM6CiAgICBjb25uZWN0aW9ucyA9IFtdCiAgICBmaW5kaW5nc1snbmV0d29yayddWydzY2Fu'
+    'X2dhcHMnXS5hcHBlbmQoJ1NvY2tldCBlbnVtZXJhdGlvbiBmYWlsZWQ6ICcgKyB0eXBlKGV4YykuX19uYW1lX18gKyAn'
+    'OiAnICsgc3RyKGV4YykpCmZvciBjb25uIGluIGNvbm5lY3Rpb25zOgogICAgdHJ5OgogICAgICAgIGRlZiBwYXJ0cyhh'
+    'ZGRyZXNzKToKICAgICAgICAgICAgaWYgbm90IGFkZHJlc3M6CiAgICAgICAgICAgICAgICByZXR1cm4gTm9uZSwgTm9u'
+    'ZQogICAgICAgICAgICBpZiBpc2luc3RhbmNlKGFkZHJlc3MsICh0dXBsZSwgbGlzdCkpOgogICAgICAgICAgICAgICAg'
+    'cmV0dXJuIChzdHIoYWRkcmVzc1swXSkgaWYgYWRkcmVzcyBlbHNlIE5vbmUpLCAoYWRkcmVzc1sxXSBpZiBsZW4oYWRk'
+    'cmVzcykgPiAxIGVsc2UgTm9uZSkKICAgICAgICAgICAgcmV0dXJuIGdldGF0dHIoYWRkcmVzcywgJ2lwJywgTm9uZSks'
+    'IGdldGF0dHIoYWRkcmVzcywgJ3BvcnQnLCBOb25lKQogICAgICAgIGxvY2FsX2lwLCBsb2NhbF9wb3J0ID0gcGFydHMo'
+    'Y29ubi5sYWRkcikKICAgICAgICByZW1vdGVfaXAsIHJlbW90ZV9wb3J0ID0gcGFydHMoY29ubi5yYWRkcikKICAgICAg'
+    'ICBjb25uX3R5cGUgPSBnZXRhdHRyKGNvbm4sICd0eXBlJywgTm9uZSkKICAgICAgICBwcm90b2NvbCA9ICd0Y3AnIGlm'
+    'IGNvbm5fdHlwZSA9PSBzb2NrZXQuU09DS19TVFJFQU0gZWxzZSAoJ3VkcCcgaWYgY29ubl90eXBlID09IHNvY2tldC5T'
+    'T0NLX0RHUkFNIGVsc2UgJ3Vua25vd24nKQogICAgICAgIHN0YXRlID0gc3RyKGdldGF0dHIoY29ubiwgJ3N0YXR1cycs'
+    'ICcnKSBvciAnVU5LTk9XTicpCiAgICAgICAgaXNfbGlzdGVuZXIgPSBzdGF0ZSA9PSAnTElTVEVOJyBvciAocHJvdG9j'
+    'b2wgPT0gJ3VkcCcgYW5kIGxvY2FsX2lwIGlzIG5vdCBOb25lIGFuZCByZW1vdGVfaXAgaXMgTm9uZSkKICAgICAgICBw'
+    'aWQgPSBnZXRhdHRyKGNvbm4sICdwaWQnLCBOb25lKQogICAgICAgIG93bmVyID0gcHJvY2Vzc19tYXAuZ2V0KHBpZCwg'
+    'eydwaWQnOiBwaWQsICdwcGlkJzogTm9uZSwgJ25hbWUnOiAndW5rbm93bicsICdleGUnOiAndW5rbm93bicsCiAgICAg'
+    'ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgJ2NtZGxpbmUnOiBbXSwgJ3VzZXInOiAndW5rbm93bicsICdw'
+    'YXJlbnRfZXhlJzogJ3Vua25vd24nfSkKICAgICAgICBmaW5kaW5nc1snbmV0d29yayddWydyYXdfb2JzZXJ2YXRpb25z'
+    'J10uYXBwZW5kKHsncHJvdG9jb2wnOiBwcm90b2NvbCwgJ2xvY2FsX2lwJzogbG9jYWxfaXAsCiAgICAgICAgICAgICds'
+    'b2NhbF9wb3J0JzogbG9jYWxfcG9ydCwgJ3JlbW90ZV9pcCc6IHJlbW90ZV9pcCwgJ3JlbW90ZV9wb3J0JzogcmVtb3Rl'
+    'X3BvcnQsCiAgICAgICAgICAgICdzdGF0ZSc6IHN0YXRlLCAnaXNfbGlzdGVuZXInOiBpc19saXN0ZW5lciwgJ3BpZCc6'
+    'IHBpZCwgJ293bmVyJzogb3duZXJ9KQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBleGM6CiAgICAgICAgZmluZGluZ3Nb'
+    'J25ldHdvcmsnXVsnc2Nhbl9nYXBzJ10uYXBwZW5kKCdTb2NrZXQgcmVjb3JkIHVuYXZhaWxhYmxlOiAnICsgdHlwZShl'
+    'eGMpLl9fbmFtZV9fKQoKaWYgYW55KGl0ZW0uZ2V0KCdsb2NhbF9wb3J0JykgPT0gMTMxMzMgb3IgX2RvY2tlcl9wcm94'
+    'eShpdGVtLmdldCgnb3duZXInKSBvciB7fSkgZm9yIGl0ZW0gaW4gZmluZGluZ3NbJ25ldHdvcmsnXVsncmF3X29ic2Vy'
+    'dmF0aW9ucyddKToKICAgIHRyeToKICAgICAgICBsaXN0ZWQgPSBzdWJwcm9jZXNzLnJ1bihbJ2RvY2tlcicsJ3BzJywn'
+    'LS1uby10cnVuYycsJy0tcXVpZXQnXSwgY2FwdHVyZV9vdXRwdXQ9VHJ1ZSwgdGV4dD1UcnVlLCB0aW1lb3V0PTgpCiAg'
+    'ICAgICAgaWYgbGlzdGVkLnJldHVybmNvZGUgIT0gMDoKICAgICAgICAgICAgZmluZGluZ3NbJ25ldHdvcmsnXVsnZG9j'
+    'a2VyX3N0YXR1cyddID0gJ2Vycm9yJwogICAgICAgICAgICBmaW5kaW5nc1snbmV0d29yayddWydzY2FuX2dhcHMnXS5h'
+    'cHBlbmQoJ0RvY2tlciBpZGVudGl0eSBsb29rdXAgZmFpbGVkOiAnICsgKGxpc3RlZC5zdGRlcnIgb3IgbGlzdGVkLnN0'
+    'ZG91dCBvciAnbm9uemVybyBleGl0Jykuc3RyaXAoKVs6MjQwXSkKICAgICAgICBlbHNlOgogICAgICAgICAgICBmaW5k'
+    'aW5nc1snbmV0d29yayddWydkb2NrZXJfc3RhdHVzJ10gPSAnYXZhaWxhYmxlJwogICAgICAgICAgICBmb3IgY29udGFp'
+    'bmVyX2lkIGluIGxpc3RlZC5zdGRvdXQuc3BsaXRsaW5lcygpOgogICAgICAgICAgICAgICAgaWYgbm90IGNvbnRhaW5l'
+    'cl9pZC5zdHJpcCgpOgogICAgICAgICAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgICAgICAgICBpbnNwZWN0ZWQg'
+    'PSBzdWJwcm9jZXNzLnJ1bihbJ2RvY2tlcicsJ2luc3BlY3QnLGNvbnRhaW5lcl9pZC5zdHJpcCgpXSwgY2FwdHVyZV9v'
+    'dXRwdXQ9VHJ1ZSwgdGV4dD1UcnVlLCB0aW1lb3V0PTgpCiAgICAgICAgICAgICAgICBpZiBpbnNwZWN0ZWQucmV0dXJu'
+    'Y29kZSAhPSAwOgogICAgICAgICAgICAgICAgICAgIGZpbmRpbmdzWyduZXR3b3JrJ11bJ2RvY2tlcl9zdGF0dXMnXSA9'
+    'ICdwYXJ0aWFsJwogICAgICAgICAgICAgICAgICAgIGZpbmRpbmdzWyduZXR3b3JrJ11bJ3NjYW5fZ2FwcyddLmFwcGVu'
+    'ZCgnRG9ja2VyIGluc3BlY3QgZmFpbGVkOiAnICsgKGluc3BlY3RlZC5zdGRlcnIgb3IgaW5zcGVjdGVkLnN0ZG91dCBv'
+    'ciAnbm9uemVybyBleGl0Jykuc3RyaXAoKVs6MjQwXSkKICAgICAgICAgICAgICAgICAgICBicmVhawogICAgICAgICAg'
+    'ICAgICAgdmFsdWUgPSBqc29uLmxvYWRzKGluc3BlY3RlZC5zdGRvdXQpCiAgICAgICAgICAgICAgICBpZiBub3QgaXNp'
+    'bnN0YW5jZSh2YWx1ZSwgbGlzdCkgb3IgbGVuKHZhbHVlKSAhPSAxOgogICAgICAgICAgICAgICAgICAgIHJhaXNlIFZh'
+    'bHVlRXJyb3IoJ2luc3BlY3QgZGlkIG5vdCByZXR1cm4gb25lIGNvbnRhaW5lcicpCiAgICAgICAgICAgICAgICBpdGVt'
+    'ID0gdmFsdWVbMF0KICAgICAgICAgICAgICAgIGZpbmRpbmdzWyduZXR3b3JrJ11bJ2RvY2tlcl9jb250YWluZXJzJ10u'
+    'YXBwZW5kKHsnaWQnOiBpdGVtLmdldCgnSWQnKSwKICAgICAgICAgICAgICAgICAgICAnbmFtZSc6IHN0cihpdGVtLmdl'
+    'dCgnTmFtZScsJycpKS5sc3RyaXAoJy8nKSwKICAgICAgICAgICAgICAgICAgICAnaW1hZ2UnOiBpdGVtLmdldCgnQ29u'
+    'ZmlnJywge30pLmdldCgnSW1hZ2UnKSwgJ2ltYWdlX2lkJzogaXRlbS5nZXQoJ0ltYWdlJyksCiAgICAgICAgICAgICAg'
+    'ICAgICAgJ3J1bm5pbmcnOiBpdGVtLmdldCgnU3RhdGUnLCB7fSkuZ2V0KCdSdW5uaW5nJykgaXMgVHJ1ZSwKICAgICAg'
+    'ICAgICAgICAgICAgICAncG9ydHMnOiBpdGVtLmdldCgnTmV0d29ya1NldHRpbmdzJywge30pLmdldCgnUG9ydHMnKSBv'
+    'ciB7fX0pCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGV4YzoKICAgICAgICBmaW5kaW5nc1snbmV0d29yayddWydkb2Nr'
+    'ZXJfc3RhdHVzJ10gPSAnZXJyb3InCiAgICAgICAgZmluZGluZ3NbJ25ldHdvcmsnXVsnc2Nhbl9nYXBzJ10uYXBwZW5k'
+    'KCdEb2NrZXIgaWRlbnRpdHkgbG9va3VwIGZhaWxlZDogJyArIHR5cGUoZXhjKS5fX25hbWVfXyArICc6ICcgKyBzdHIo'
+    'ZXhjKSkKCmlmIGZpbmRpbmdzWyduZXR3b3JrJ11bJ3NjYW5fZ2FwcyddOgogICAgZmluZGluZ3NbJ25ldHdvcmsnXVsn'
+    'c2Nhbl9zdGF0dXMnXSA9ICdwYXJ0aWFsJwoKZm9yIHUgaW4gcHN1dGlsLnVzZXJzKCk6CiAgICBmaW5kaW5nc1sndXNl'
+    'cnMnXVsnbG9nZ2VkX2luJ10uYXBwZW5kKHsnbmFtZSc6IHUubmFtZSwgJ3Rlcm1pbmFsJzogdS50ZXJtaW5hbCwgJ2hv'
+    'c3QnOiB1Lmhvc3QsCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAnc3RhcnRlZCc6IHN0'
+    'cihkYXRldGltZS5mcm9tdGltZXN0YW1wKHUuc3RhcnRlZCkpfSkKbW9kID0gcnVuKCJmaW5kIC9ldGMgL2JpbiAvc2Jp'
+    'biAvdXNyL2JpbiAvdXNyL3NiaW4gLW5ld2VyIC90bXAgLXR5cGUgZiAtcHJpbnRmICclVCsgJXBcbicgMj4vZGV2L251'
+    'bGwgfCBzb3J0IC1yIHwgaGVhZCAtMjAiKQpmaW5kaW5nc1snZmlsZXMnXVsncmVjZW50bHlfbW9kaWZpZWRfc3lzdGVt'
+    'J10gPSBtb2Quc3BsaXRsaW5lcygpIGlmIG1vZCBlbHNlIFtdCmZhaWxlZCA9IHJ1bignc3lzdGVtY3RsIGxpc3QtdW5p'
+    'dHMgLS10eXBlPXNlcnZpY2UgLS1zdGF0ZT1mYWlsZWQgLS1uby1wYWdlciAtLW5vLWxlZ2VuZCAyPi9kZXYvbnVsbCB8'
+    'IGhlYWQgLTIwJykKZmluZGluZ3NbJ3NlcnZpY2VzJ11bJ2ZhaWxlZCddID0gZmFpbGVkLnNwbGl0bGluZXMoKSBpZiBm'
+    'YWlsZWQgZWxzZSBbXQpuZXdfdW5pdHMgPSBydW4oImZpbmQgL2V0Yy9zeXN0ZW1kIC91c3IvbGliL3N5c3RlbWQgLW5h'
+    'bWUgJyouc2VydmljZScgLW5ld2VyIC90bXAgLXR5cGUgZiAyPi9kZXYvbnVsbCB8IGhlYWQgLTIwIikKZmluZGluZ3Nb'
+    'J3NlcnZpY2VzJ11bJ25ld191bml0cyddID0gbmV3X3VuaXRzLnNwbGl0bGluZXMoKSBpZiBuZXdfdW5pdHMgZWxzZSBb'
+    'XQpjcm9uID0gcnVuKCdjcm9udGFiIC1sIDI+L2Rldi9udWxsOyBscyAvZXRjL2Nyb24uZC8gMj4vZGV2L251bGw7IGxz'
+    'IC92YXIvc3Bvb2wvY3Jvbi9jcm9udGFicy8gMj4vZGV2L251bGwnKQpmaW5kaW5nc1snY3JvbiddWydlbnRyaWVzJ10g'
+    'PSBjcm9uLnNwbGl0bGluZXMoKSBpZiBjcm9uIGVsc2UgW10KYXV0aCA9IHJ1bigiZ3JlcCAtRWkgJ2ZhaWxlZHxpbnZh'
+    'bGlkfGVycm9yfHN1ZG98dXNlcmFkZHx1c2VyZGVsfHBhc3N3ZCcgL3Zhci9sb2cvYXV0aC5sb2cgMj4vZGV2L251bGwg'
+    'fCB0YWlsIC01MCIpCmZpbmRpbmdzWydhdXRoX2xvZyddID0gYXV0aC5zcGxpdGxpbmVzKCkgaWYgYXV0aCBlbHNlIFtd'
+    'CnByaW50KGpzb24uZHVtcHMoZmluZGluZ3MpKQo='
+    '\'))"; rc=$?; printf \'\\n__AURORA_SECURITY_EXIT__=%s\\n\' "$rc"; exit "$rc"'
+)
+
+
+class RegWindowsTransportTests(unittest.TestCase):
+    """
+    REG-WIN-TRANSPORT-1 — the Windows command fits cmd.exe and still runs the
+    exact Windows program.
+
+    Plain base64 of the 9,427-byte program produced a 12,624-character command,
+    so cmd.exe truncated it mid-base64 and returned nothing at all. The transport
+    is compressed; this test proves the command fits, that it carries the real
+    program, that nothing needs a third-party module to decode it, and that the
+    Linux transport beside it was not touched in the process.
+    """
+
+    def payload(self, command):
+        match = re.search(r"b64decode\('([A-Za-z0-9+/=]+)'\)", command)
+        self.assertIsNotNone(match, "the Windows command carries no base64 payload")
+        return match.group(1)
+
+    def test_reg_win_transport_1_the_command_fits_and_decodes_to_the_program(self):
+        """REG-WIN-TRANSPORT-1: under the limit, and byte-for-byte the program."""
+        command = security_scanner._build_remote_command_windows()
+        payload = self.payload(command)
+
+        # 1. The command fits the shell that will run it.
+        self.assertLess(len(command), WINDOWS_COMMAND_LIMIT)
+
+        # 2. The guard is meaningful: the plain-base64 form this replaced would
+        #    NOT have fit, so the size assertion is not vacuously true.
+        plain = ("python -c \"exec(__import__('base64').b64decode('"
+                 + base64.b64encode(
+                     security_scanner._REMOTE_SCRIPT_WINDOWS.encode("utf-8")).decode("ascii")
+                 + "'))\"")
+        self.assertGreater(len(plain), WINDOWS_COMMAND_LIMIT)
+        self.assertLess(len(command), len(plain))
+
+        # 3. What the Windows host will execute is the Windows program, exactly.
+        decoded = gzip.decompress(base64.b64decode(payload))
+        self.assertEqual(decoded.decode("utf-8"), security_scanner._REMOTE_SCRIPT_WINDOWS)
+        compile(decoded.decode("utf-8"), "windows_security", "exec")
+
+        # 4. The transport is visible and inert as far as the shell is concerned.
+        self.assertIn("gzip.decompress(", command)
+        self.assertIn("b64decode('", command)
+        self.assertRegex(payload, r"^[A-Za-z0-9+/=]+$")
+        for token in LINUX_ONLY_TOKENS:
+            with self.subTest(token=token):
+                self.assertNotIn(token, command)
+
+        # 5. Only the Python standard library is needed to decode it.
+        self.assertIn("import base64,gzip;", command)
+
+    def test_reg_win_transport_1_the_command_is_byte_deterministic(self):
+        """REG-WIN-TRANSPORT-1: gzip mtime=0, so the command is reproducible."""
+        self.assertEqual(security_scanner._build_remote_command_windows(),
+                         security_scanner._build_remote_command_windows())
+
+    def test_reg_win_transport_1_the_linux_transport_is_untouched(self):
+        """REG-WIN-TRANSPORT-1 (preservation guard): Linux is byte-identical."""
+        self.assertEqual(security_scanner._build_remote_command(), PINNED_LINUX_COMMAND)
+        self.assertTrue(PINNED_LINUX_COMMAND.rstrip().endswith('exit "$rc"'))
+        self.assertIn("python3 -c \"import base64;exec(base64.b64decode('",
+                      PINNED_LINUX_COMMAND)
+        self.assertNotIn("gzip", PINNED_LINUX_COMMAND)
+        self.assertIs(security_scanner.collect_remote, security_scanner.collect_remote_linux)
 
 
 class RegWindowsProgramTests(unittest.TestCase):
@@ -1470,6 +1691,327 @@ class RegWindowsPolicyEquivalenceTests(unittest.TestCase):
                 self.assertTrue(security_scanner.has_any_findings(findings))
         self.assertIsNone(self.collect(good)["error"])
         self.assertEqual(self.collect(good)["network"]["risk"]["posture"], "complete")
+
+
+class RegWindowsEmptyOutputTests(unittest.TestCase):
+    """
+    REG-WIN-TRANSPORT-2 — an empty response and a lost trailer are told apart.
+
+    Both used to collapse into "response is missing its exit status", so a Windows
+    command cmd.exe truncated and a protocol bug looked identical to whoever read
+    the report. Every case here is fail-closed; what changes is only WHICH message
+    the operator gets.
+    """
+
+    GOOD_PAYLOAD = {
+        "os_type": "windows",
+        "processes": {}, "users": {}, "files": {},
+        "services": {"failed": [], "new_units": []}, "cron": {"entries": []},
+        "auth_log": [],
+        "network": {"raw_observations": [], "docker_containers": [],
+                    "docker_status": "not_applicable",
+                    "scan_status": "complete", "scan_gaps": []},
+    }
+
+    def collect(self, body):
+        return security_scanner.collect_remote_windows(
+            {"name": "WINDBOX"}, lambda inst, cmd: body, config())
+
+    def assert_fail_closed(self, findings):
+        self.assertIsNotNone(findings["error"])
+        self.assertEqual(findings["network"]["scan_status"], "failed")
+        self.assertEqual(findings["network"]["risk"]["posture"], "failed")
+        self.assertGreaterEqual(
+            _risk_order(findings["network"]["risk"]["level"]), _risk_order("medium"))
+        self.assertTrue(security_scanner.has_any_findings(findings))
+
+    def test_reg_win_transport_2_no_output_is_not_a_missing_trailer(self):
+        """REG-WIN-TRANSPORT-2: empty stdout names ITSELF, and still fails."""
+        for label, body in {"empty": "", "whitespace": "  \n\t \r\n "}.items():
+            with self.subTest(response=label):
+                findings = self.collect(body)
+
+                self.assertIn("produced no output", findings["error"])
+                self.assertNotIn("missing its exit status", findings["error"])
+                self.assert_fail_closed(findings)
+
+    def test_reg_win_transport_2_a_missing_trailer_keeps_its_own_message(self):
+        """REG-WIN-TRANSPORT-2: valid JSON, no trailer — unchanged wording."""
+        findings = self.collect(json.dumps(self.GOOD_PAYLOAD))
+
+        self.assertEqual(findings["error"],
+                         "Remote security scanner response is missing its exit status")
+        self.assert_fail_closed(findings)
+
+    def test_reg_win_transport_2_the_other_failure_shapes_are_unchanged(self):
+        """REG-WIN-TRANSPORT-2: nonzero trailer, junk and SSH loss still fail."""
+        good = json.dumps(self.GOOD_PAYLOAD)
+        shapes = {
+            "nonzero trailer": (good + "\n__AURORA_SECURITY_EXIT__=3",
+                                "Remote security scanner exited nonzero"),
+            "unparsable payload": ("not json at all",
+                                   "Remote security scanner response is missing its exit status"),
+            "payload without network evidence": (json.dumps({"processes": {}}),
+                                                 "Remote security scanner response is missing its exit status"),
+            "ssh unreachable": (None, "SSH unreachable"),
+        }
+        for label, (body, expected) in shapes.items():
+            with self.subTest(failure=label):
+                findings = self.collect(body)
+
+                self.assertEqual(findings["error"], expected)
+                self.assert_fail_closed(findings)
+
+    def test_reg_win_transport_2_a_real_payload_is_still_a_clean_pass(self):
+        """REG-WIN-TRANSPORT-2: the new branch does not touch the success path."""
+        findings = self.collect(json.dumps(self.GOOD_PAYLOAD)
+                                + "\n__AURORA_SECURITY_EXIT__=0")
+
+        self.assertIsNone(findings["error"])
+        self.assertEqual(findings["network"]["scan_status"], "complete")
+        self.assertEqual(findings["network"]["risk"]["posture"], "complete")
+
+
+class RegWindowsStderrDiagnosticTests(unittest.TestCase):
+    """
+    REG-WIN-TRANSPORT-3 — a remote that died before printing is diagnosable.
+
+    stdout alone cannot say why a Windows host returned nothing, so the security
+    path now reads the SSH stderr and exit status too. What reaches the report is
+    a short sanitized fragment: never key material, a token, a path, a username
+    or a hostname, and never more than ~240 characters.
+    """
+
+    GOOD_PAYLOAD = RegWindowsEmptyOutputTests.GOOD_PAYLOAD
+
+    # One realistic remote failure: a Windows Python that cannot even start the
+    # program, with a key path, a username and a hostname in the message.
+    TRACEBACK = (
+        'Traceback (most recent call last):\n'
+        '  File "C:\\Users\\Administrator\\AppData\\Local\\Temp\\run.py", line 1, in <module>\n'
+        '    exec(gzip.decompress(base64.b64decode(\'H4sIAAAAAAAA\')))\n'
+        'ModuleNotFoundError: No module named \'gzip\'\n'
+        'AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE on win-box.example.com'
+    )
+    FORBIDDEN = (
+        "AKIAIOSFODNN7EXAMPLE", "AWS_SECRET_ACCESS_KEY=AKIA",
+        "C:\\Users\\Administrator", "AppData", "Administrator",
+        "win-box.example.com", "/tmp/", "-----BEGIN",
+    )
+
+    def collect(self, result):
+        return security_scanner.collect_remote_windows(
+            {"name": "WINDBOX"}, lambda inst, cmd: result, config())
+
+    def assert_fail_closed(self, findings):
+        self.assertIsNotNone(findings["error"])
+        self.assertEqual(findings["network"]["scan_status"], "failed")
+        self.assertEqual(findings["network"]["risk"]["posture"], "failed")
+        self.assertTrue(security_scanner.has_any_findings(findings))
+
+    def detailed(self, stdout="", stderr="", exit_status=None):
+        return monitor.SSHResult(stdout, stderr, exit_status, False)
+
+    def test_reg_win_transport_3_stderr_reaches_the_findings_sanitized(self):
+        """REG-WIN-TRANSPORT-3: the reason is present, short and inert."""
+        findings = self.collect(self.detailed(stderr=self.TRACEBACK, exit_status=1))
+
+        error = findings["error"]
+        self.assertIn("produced no output", error)
+        # Something recognizable survived: this is a diagnosis, not a blackout.
+        self.assertIn("Traceback", error)
+        self.assertIn("ModuleNotFoundError", error)
+        for secret in self.FORBIDDEN:
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, error)
+        # The remote's own exit status is part of the diagnosis.
+        self.assertIn("exit status 1", error)
+        self.assert_fail_closed(findings)
+
+    def test_reg_win_transport_3_the_diagnostic_is_capped(self):
+        """REG-WIN-TRANSPORT-3: stderr cannot grow the message without bound."""
+        cap = security_scanner._REMOTE_DIAGNOSTIC_CAP
+        findings = self.collect(self.detailed(
+            stderr="SyntaxError: " + ("'token=ghp_secretvalue' " * 60), exit_status=1))
+
+        error = findings["error"]
+        # The message is the fixed wording plus a capped, escaped fragment.
+        self.assertLessEqual(len(error), len("Remote security scanner produced no output: ") + cap)
+        self.assertIn("SyntaxError", error)
+        self.assertNotIn("ghp_secretvalue", error)
+
+    def test_reg_win_transport_3_a_plain_runner_still_works_unchanged(self):
+        """
+        REG-WIN-TRANSPORT-3: a plain str-or-None runner is still accepted.
+
+        The existing collection tests already pass a lambda returning a plain
+        string; this is the backward-compatibility contract stated directly, so a
+        later change to shape detection cannot silently break it.
+        """
+        good = json.dumps(self.GOOD_PAYLOAD) + "\n__AURORA_SECURITY_EXIT__=0"
+        findings = security_scanner.collect_remote_windows(
+            {"name": "WINDBOX"}, lambda inst, cmd: good, config())
+
+        self.assertIsNone(findings["error"])
+        self.assertEqual(findings["network"]["scan_status"], "complete")
+        # The unreachable sentinel and an empty string stay distinguishable.
+        self.assertEqual(
+            security_scanner.collect_remote_windows(
+                {"name": "WINDBOX"}, lambda inst, cmd: None, config())["error"],
+            "SSH unreachable")
+
+    def test_reg_win_transport_3_a_nonzero_remote_status_stays_fail_closed(self):
+        """REG-WIN-TRANSPORT-3: a nonzero remote result never looks clean."""
+        good = json.dumps(self.GOOD_PAYLOAD) + "\n__AURORA_SECURITY_EXIT__=0"
+        for label, result in {
+            "no output at all": self.detailed(stderr="boom", exit_status=2),
+            "payload but nonzero exit": self.detailed(good, stderr="warning", exit_status=2),
+        }.items():
+            with self.subTest(shape=label):
+                findings = self.collect(result)
+
+                self.assert_fail_closed(findings)
+
+    def test_reg_win_transport_3_a_silent_remote_is_not_invented(self):
+        """REG-WIN-TRANSPORT-3: no stderr means no invented diagnostic."""
+        findings = self.collect(self.detailed())
+
+        self.assertEqual(findings["error"], "Remote security scanner produced no output")
+
+    def test_reg_win_transport_3_the_diagnostic_is_markdown_escaped_in_the_report(self):
+        """
+        REG-WIN-TRANSPORT-3: the fragment reaches Telegram through escape_markdown.
+
+        The reason is host-derived text, so the render sites must escape it or the
+        API can reject the whole chunk. Asserted against what a client renders, not
+        against the formatter's source.
+        """
+        findings = self.collect(self.detailed(
+            stderr='SyntaxError: invalid syntax (x_1 = *a`, [b] = *c)', exit_status=1))
+        self.assertIn("_", findings["error"])
+
+        chunks = llm_analyzer.format_assessment(findings, "2026-09-29 12:00:00")
+        text = re.sub(r"\\([_*`\[\]])", r"\1", "\n".join(chunks))
+        self.assertIn("produced no output", text)
+        self.assertIn("SyntaxError", text)
+        # The fragment's own reserved characters are escaped, so what a client
+        # renders is the same text the collector produced rather than a mangled
+        # or truncated one: the code-span delimiters stay balanced and no bracket
+        # survives to open a link.
+        for chunk in chunks:
+            for char in ("`", "_"):
+                with self.subTest(char=char):
+                    self.assertEqual(
+                        len(re.findall(r"(?<!\\)" + re.escape(char), chunk)) % 2, 0, chunk)
+            with self.subTest(char="["):
+                self.assertEqual(len(re.findall(r"(?<!\\)\[", chunk)), 0, chunk)
+            self.assertLessEqual(len(chunk), llm_analyzer.MAX_TELEGRAM_CHUNK)
+
+    def test_reg_win_transport_3_sanitize_remote_diagnostic_directly(self):
+        """REG-WIN-TRANSPORT-3: each sensitive class is removed on its own."""
+        cases = {
+            "private key": ("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKC\n"
+                            "-----END RSA PRIVATE KEY-----", "MIIEowIBAAKC"),
+            "env assignment": ("MY_API_TOKEN=s3cr3tvalue123", "s3cr3tvalue123"),
+            "password": ("password: hunter2xyz", "hunter2xyz"),
+            "windows path": (r"C:\Windows\System32\winevt\Logs\System.evtx", "System32"),
+            "unc path": (r"\\fileserver\share\secret.txt", "fileserver"),
+            "posix path": ("/home/ubuntu/dev/monitor_bot/venv/keys/win.pem", "monitor_bot"),
+            "username": ("Authentication failed for user svc-deploy", "svc-deploy"),
+            "ipv4 host": ("Connection to 203.0.113.10 refused", "203.0.113.10"),
+            "hostname": ("unknown host win-box.example.com", "win-box.example.com"),
+            "long blob": ("payload " + "A" * 64, "A" * 64),
+        }
+        for label, (text, secret) in cases.items():
+            with self.subTest(class_=label):
+                cleaned = security_scanner.sanitize_remote_diagnostic(text)
+
+                self.assertNotIn(secret, cleaned)
+                self.assertLessEqual(len(cleaned),
+                                     security_scanner._REMOTE_DIAGNOSTIC_CAP)
+        # Nothing and nothing useful never crash, and never invent a reason.
+        for value in (None, "", "   \n\t ", 0):
+            self.assertEqual(security_scanner.sanitize_remote_diagnostic(value), "")
+
+    def test_reg_win_transport_3_ssh_run_keeps_its_signature_and_result(self):
+        """
+        REG-WIN-TRANSPORT-3: ssh_run is unchanged for every existing caller.
+
+        It still returns stdout on success and None on any failure, from the same
+        single connection, and it still logs remote stderr.
+        """
+        import paramiko
+
+        inst = {"ip": "203.0.113.10", "ssh_user": "Administrator",
+                "key": "/keys/win.pem"}
+
+        class Channel:
+            def __init__(self, status):
+                self.status = status
+
+            def recv_exit_status(self):
+                return self.status
+
+        class Stream:
+            def __init__(self, text):
+                self.text = text
+
+            def read(self):
+                return self.text.encode()
+
+            @property
+            def channel(self):
+                return Channel(self.exit_status)
+
+        class Client:
+            exit_status = 0
+
+            def __init__(self):
+                self.commands = []
+                self.connections = 0
+                self.closed = 0
+
+            def set_missing_host_key_policy(self, policy):
+                pass
+
+            def connect(self, ip, username=None, pkey=None, timeout=None):
+                self.connections += 1
+
+            def exec_command(self, command):
+                self.commands.append(command)
+                stdout, stderr = Stream("payload\n"), Stream("a warning\n")
+                stdout.exit_status = stderr.exit_status = Client.exit_status
+                return None, stdout, stderr
+
+            def close(self):
+                self.closed += 1
+
+        client = Client()
+        with mock.patch.object(monitor.paramiko, "SSHClient", lambda: client), \
+                mock.patch.object(monitor, "load_private_key", lambda path: object()):
+            stdout = monitor.ssh_run(inst, "whoami")
+            self.assertEqual(stdout, "payload")
+            # ONE connection and ONE command: the refactor bought diagnostics
+            # without a second round trip.
+            self.assertEqual(client.connections, 1)
+            self.assertEqual(client.commands, ["whoami"])
+            self.assertEqual(client.closed, 1)
+
+            detailed = monitor.ssh_run_detailed(inst, "whoami")
+            self.assertEqual(detailed.stdout, "payload")
+            self.assertEqual(detailed.stderr, "a warning")
+            self.assertEqual(detailed.exit_status, 0)
+            self.assertFalse(detailed.unreachable)
+            self.assertEqual(client.connections, 2)
+
+            # A failure is still exactly None, from both entry points.
+            Client.exit_status = 0
+            with mock.patch.object(monitor, "load_private_key",
+                                   mock.Mock(side_effect=paramiko.SSHException("down"))):
+                self.assertIsNone(monitor.ssh_run(inst, "whoami"))
+                failed = monitor.ssh_run_detailed(inst, "whoami")
+                self.assertIsNone(failed.stdout)
+                self.assertTrue(failed.unreachable)
 
 
 def _risk_order(level):
