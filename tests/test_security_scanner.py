@@ -27,6 +27,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import llm_analyzer
 import monitor
 import security_scanner
 
@@ -169,6 +170,13 @@ BOT_PROCESS = owner(900, "python", BOT_EXE, [BOT_EXE, BOT_SCRIPT], user=BOT_USER
 TAILSCALED = owner(950, "tailscaled", TAILSCALE_EXE, [TAILSCALE_EXE], user=BOT_USER)
 UNKNOWN_SCRIPT = owner(980, "python3", "/usr/bin/python3", ["python3", "/tmp/unknown.py"], user="www-data")
 INIT = owner(1, "systemd", "/sbin/init", ["/sbin/init"], user="root", ppid=0)
+# Windows-shaped owners used by the Windows regressions below.
+SVCHOST = owner(700, "svchost.exe", "C:\\Windows\\System32\\svchost.exe",
+                ["svchost.exe", "-k", "netsvcs"], user="NT AUTHORITY\\SYSTEM")
+SQLSERVR = owner(900, "sqlservr.exe", "C:\\Program Files\\Microsoft SQL Server\\sqlservr.exe",
+                 ["sqlservr.exe"], user="NT SERVICE\\MSSQLSERVER")
+WINDOWS_SCRIPT = owner(980, "python.exe", "C:\\Users\\svc\\python.exe",
+                       ["python.exe", "-c", "payload"], user="WIN-WEB\\svc")
 
 
 def psutil_info(process_owner):
@@ -1114,6 +1122,354 @@ class AuthLogCollectionTests(unittest.TestCase):
 
         self.assertIn("authentication log entries", risk["corroboration"])
         self.assertEqual(risk["level"], "high")
+
+
+# ─── REQUIRED REGRESSIONS REG-11 / REG-12 ─────────────────
+
+# Tokens that may only ever appear in a LINUX program. None of them may reach the
+# Windows command, and none of them may reach the Windows program either.
+LINUX_ONLY_TOKENS = (
+    "systemctl", "crontab", "/var/log/auth.log", "find /etc", "/bin", "/sbin",
+    "/usr/bin", "/usr/sbin", "printf", "$?", "; exit",
+)
+# The two payload keys the central policy reads. They are the ONLY place the
+# word may appear in the Windows program: a key name, never a command.
+WINDOWS_PAYLOAD_KEYS = ("docker_containers", "docker_status")
+
+
+def _windows_program():
+    match = re.search(r"b64decode\('([A-Za-z0-9+/=]+)'\)",
+                      security_scanner._build_remote_command_windows())
+    assert match is not None, "the Windows command carries no base64 program"
+    return base64.b64decode(match.group(1)).decode("utf-8")
+
+
+def _strip_windows_payload_keys(program):
+    return program.replace("docker_containers", "").replace("docker_status", "")
+
+
+def _run_windows_program(sockets, processes, users=()):
+    """
+    Execute the DECODED Windows program against a fake psutil.
+
+    The program text is what actually runs, so the payload under test is the one
+    the Windows host would produce. Nothing here reaches a real Windows host, a
+    real `powershell`, or the network.
+    """
+    module = fake_psutil(sockets, processes, users)
+    program = _windows_program()
+    stdout = io.StringIO()
+    with (
+        mock.patch.dict(sys.modules, {"psutil": module}),
+        redirect_stdout(stdout),
+    ):
+        exec(compile(program, "remote_security_windows", "exec"),
+             {"__name__": "__main__"})
+    raw = stdout.getvalue()
+    body, marker, trailer = raw.rpartition("\n__AURORA_SECURITY_EXIT__=")
+    assert marker == "\n__AURORA_SECURITY_EXIT__=", "the trailer format changed"
+    return raw, json.loads(body), trailer.strip()
+
+
+class RegWindowsProgramTests(unittest.TestCase):
+    """
+    REG-11 — the Windows collector carries no Linux-only command.
+
+    Runtime blocker: Windows-native command BEHAVIOUR cannot be exercised on the
+    Linux build host, so the assertions here cover the generated text and the
+    parse-back path only.
+    """
+
+    def powershell_stub(self, tmp, message="access denied"):
+        """A `powershell` on PATH that reports access denied for every query."""
+        stub = Path(tmp) / "powershell"
+        stub.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stderr.write(%r)\n"
+            "sys.exit(1)\n" % message
+        )
+        stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+        return dict(os.environ, PATH=f"{tmp}:{os.environ.get('PATH', '')}")
+
+    def test_reg_11_the_windows_program_has_no_linux_only_command(self):
+        """REG-11: no Linux-only command or path literal, and it compiles."""
+        command = security_scanner._build_remote_command_windows()
+        program = _windows_program()
+
+        self.assertIn("b64decode('", command)
+        for token in LINUX_ONLY_TOKENS:
+            with self.subTest(token=token):
+                self.assertNotIn(token, command)
+                self.assertNotIn(token, program)
+        # "docker" survives only as the two payload keys the policy reads.
+        self.assertNotIn("docker", _strip_windows_payload_keys(program))
+        for key in WINDOWS_PAYLOAD_KEYS:
+            with self.subTest(payload_key=key):
+                self.assertIn(key, program)
+        self.assertIn("not_applicable", program)
+        compile(program, "remote_security_windows", "exec")
+
+    def test_reg_11_unavailable_categories_are_declared_and_never_silent(self):
+        """REG-11: the program names what it could not collect, and it parses back."""
+        program = _windows_program()
+        sockets = [sock("127.0.0.1", 13133, state="LISTEN", pid=500),
+                   sock("0.0.0.0", 443, state="LISTEN", pid=700)]
+        processes = [dict(SVCHOST), dict(INIT)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self.powershell_stub(tmp)
+            output = io.StringIO()
+            with (
+                mock.patch.dict(sys.modules, {"psutil": fake_psutil(
+                    sockets, [psutil_info(item) for item in processes])}),
+                mock.patch.dict(os.environ, env, clear=True),
+                redirect_stdout(output),
+            ):
+                exec(compile(program, "remote_security_windows", "exec"),
+                     {"__name__": "__main__"})
+
+        raw = output.getvalue()
+        body, marker, trailer = raw.rpartition("\n__AURORA_SECURITY_EXIT__=")
+        self.assertEqual(marker, "\n__AURORA_SECURITY_EXIT__=")
+        self.assertEqual(trailer.strip(), "0")
+        payload = json.loads(body)
+
+        # The uncollected categories are named, not silently returned as empty.
+        self.assertTrue(payload["unavailable"])
+        for category in ("cron", "files", "services", "auth_log"):
+            with self.subTest(category=category):
+                self.assertIn(category, payload["unavailable"])
+        self.assertEqual(payload["cron"]["entries"], [])
+        self.assertEqual(payload["files"]["recently_modified_system"], [])
+        self.assertIn("access denied", " ".join(payload["network"]["scan_gaps"]))
+        self.assertNotEqual(payload["network"]["scan_status"], "complete")
+
+        findings = security_scanner.collect_remote_windows(
+            {"name": "WINDBOX"},
+            lambda inst, cmd: raw, config(),
+        )
+        self.assertNotEqual(findings["network"]["scan_status"], "complete")
+        self.assertEqual(findings["network"]["risk"]["posture"], "incomplete")
+        self.assertGreaterEqual(_risk_order(findings["network"]["risk"]["level"]),
+                                _risk_order("medium"))
+        self.assertIsNone(findings["error"])
+        self.assertTrue(findings["network"]["scan_gaps"])
+        self.assertTrue(security_scanner.has_any_findings(findings))
+
+
+class RegWindowsPolicyEquivalenceTests(unittest.TestCase):
+    """
+    REG-12 — Windows evidence is classified by the UNCHANGED central policy.
+
+    The reference is computed by feeding the same raw list through
+    _finalize_network on this host, so a Windows-vs-Linux divergence in
+    classification, direction, bind scope or confidence fails here.
+    """
+
+    RAW = [
+        {"protocol": "tcp", "local_ip": "127.0.0.1", "local_port": 13133,
+         "remote_ip": None, "remote_port": None, "state": "LISTEN",
+         "is_listener": True, "pid": 500, "owner": DOCKER_PROXY},
+        {"protocol": "tcp", "local_ip": "0.0.0.0", "local_port": 443,
+         "remote_ip": None, "remote_port": None, "state": "LISTEN",
+         "is_listener": True, "pid": 700, "owner": SVCHOST},
+        {"protocol": "tcp", "local_ip": "10.0.1.5", "local_port": 3389,
+         "remote_ip": None, "remote_port": None, "state": "LISTEN",
+         "is_listener": True, "pid": 700, "owner": SVCHOST},
+        {"protocol": "tcp", "local_ip": "10.0.1.5", "local_port": 53124,
+         "remote_ip": "203.0.113.99", "remote_port": 443, "state": "ESTABLISHED",
+         "is_listener": False, "pid": 900, "owner": SQLSERVR},
+        {"protocol": "tcp", "local_ip": "10.0.1.5", "local_port": 4444,
+         "remote_ip": None, "remote_port": None, "state": "LISTEN",
+         "is_listener": True, "pid": 980, "owner": WINDOWS_SCRIPT},
+    ]
+
+    def payload(self):
+        return {
+            "os_type": "windows",
+            "processes": {}, "users": {}, "files": {},
+            "services": {"failed": [], "new_units": []}, "cron": {"entries": []},
+            "auth_log": [],
+            "network": {"raw_observations": [dict(item) for item in self.RAW],
+                        "docker_containers": [], "docker_status": "not_applicable",
+                        "scan_status": "complete", "scan_gaps": []},
+        }
+
+    def signature(self, network):
+        return sorted(
+            (obs["local_ip"], obs["local_port"], obs["remote_ip"], obs["remote_port"],
+             obs["protocol"], obs["direction"], obs["bind_scope"], obs["is_listener"],
+             obs["classification"], obs["confidence"],
+             obs["container"]["name"] if obs["container"] else None)
+            for obs in network["observations"]
+        )
+
+    def collect(self, body):
+        return security_scanner.collect_remote_windows(
+            {"name": "WINDBOX"},
+            lambda inst, cmd: body, config(),
+        )
+
+    def test_reg_12_windows_evidence_reaches_the_unchanged_policy(self):
+        """REG-12: identical signature, counts, totals and risk as the local path."""
+        payload = self.payload()
+        remote = self.collect(json.dumps(payload) + "\n__AURORA_SECURITY_EXIT__=0")
+
+        reference = security_scanner._base_findings("WINDBOX", "local")
+        security_scanner._finalize_network(
+            reference, [dict(item) for item in self.RAW], [], "not_applicable", [],
+            config(), "complete",
+        )
+
+        self.assertIsNone(remote["error"])
+        self.assertEqual(self.signature(remote["network"]), self.signature(reference["network"]))
+        self.assertEqual(remote["network"]["category_counts"],
+                         reference["network"]["category_counts"])
+        self.assertEqual(remote["network"]["totals"], reference["network"]["totals"])
+        self.assertEqual(remote["network"]["risk"]["level"],
+                         reference["network"]["risk"]["level"])
+        self.assertEqual(remote["network"]["risk"]["posture"],
+                         reference["network"]["risk"]["posture"])
+        self.assertEqual(remote["network"]["external_connections"],
+                         reference["network"]["external_connections"])
+        self.assertEqual(remote["network"]["unexpected_listening"],
+                         reference["network"]["unexpected_listening"])
+        # A Windows service binary on a private interface is reviewed, never
+        # expected: no KNOWN_SERVICES entry is invented for it.
+        listener = only(remote["network"]["observations"], local_port=3389)[0]
+        self.assertEqual(listener["classification"], "needs_review")
+        self.assertEqual(listener["bind_scope"], "private-interface")
+
+    def test_reg_14_a_realistic_windows_temp_exe_is_matched_or_declared_absent(self):
+        """
+        REV-WIN-002: the temp-path signal fires on a real Windows path.
+
+        Drive-letter and UNC forms both begin with characters a bare
+        `\\\\AppData\\Local\\Temp\\` prefix can never match, so `startswith` made
+        this signal permanently empty. Either it matches, or `processes` is
+        declared unavailable and the scan is not presented as complete.
+        """
+        dropper = owner(4242, "dropper.exe",
+                        "C:\\Users\\svc\\AppData\\Local\\Temp\\dropper.exe",
+                        ["dropper.exe"], user="WIN-WEB\\svc")
+        unc = owner(4243, "dropper.exe",
+                    "\\\\host\\share\\AppData\\Local\\Temp\\dropper.exe",
+                    ["dropper.exe"], user="WIN-WEB\\svc")
+        windows_temp = owner(4244, "dropper.exe",
+                             "C:\\Windows\\Temp\\dropper.exe",
+                             ["dropper.exe"], user="WIN-WEB\\svc")
+        processes = [psutil_info(dropper), psutil_info(unc),
+                     psutil_info(windows_temp), dict(SVCHOST), dict(INIT)]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env = RegWindowsProgramTests().powershell_stub(tmp)
+            with mock.patch.dict(os.environ, env, clear=True):
+                _raw, payload, trailer = _run_windows_program(
+                    [sock("0.0.0.0", 443, state="LISTEN", pid=700)], processes)
+
+        self.assertEqual(trailer, "0")
+        matched = [item["exe"].lower() for item in payload["processes"]["suspicious_path"]]
+        self.assertEqual(len(matched), 3)
+        for expected in (dropper["exe"], unc["exe"], windows_temp["exe"]):
+            self.assertIn(expected.lower(), matched)
+
+        findings = security_scanner.collect_remote_windows(
+            {"name": "WINDBOX"}, lambda inst, cmd: _raw, config())
+        paths = findings["processes"]["suspicious_path"]
+        self.assertEqual(len(paths), 3)
+        # The match reaches the consumer that silently lost the signal before.
+        assessment = llm_analyzer.build_assessment(findings)
+        self.assertEqual(assessment["non_network"]["suspicious_processes"], 3)
+        self.assertTrue(security_scanner.has_any_findings(findings))
+
+    def test_reg_15_the_named_unavailability_survives_a_full_gap_budget(self):
+        """
+        REV-WIN-001: the operator always learns WHICH categories are unavailable.
+
+        Six denied process identities produce six identical per-item gaps. The
+        report's gap budget must still carry the statement naming `cron`, `files`,
+        `services` and `auth_log`, and must not spend itself on duplicates.
+        """
+        report = llm_analyzer.format_assessment
+
+        def denied(count):
+            """A psutil stand-in denying `count` process identities."""
+            class Denied(Exception):
+                pass
+
+            base = fake_psutil([sock("0.0.0.0", 443, state="LISTEN", pid=700)],
+                               [psutil_info(SVCHOST), psutil_info(INIT)])
+            allowed = list(base.process_iter())
+
+            def process_iter(attrs=None):
+                for info in allowed:
+                    yield SimpleNamespace(info=info)
+                for index in range(count):
+                    yield SimpleNamespace(info=property(lambda self: (_ for _ in ()).throw(
+                        base.AccessDenied("access denied"))))
+            base.process_iter = process_iter
+            return base, Denied
+
+        for count in (0, 4, 5, 6, 12):
+            with self.subTest(denied_identities=count):
+                module, _denied = denied(count)
+                with tempfile.TemporaryDirectory() as tmp:
+                    env = RegWindowsProgramTests().powershell_stub(tmp)
+                    with mock.patch.dict(os.environ, env, clear=True):
+                        with mock.patch.dict(sys.modules, {"psutil": module}):
+                            raw, payload, _trailer = _run_windows_program(
+                                [sock("0.0.0.0", 443, state="LISTEN", pid=700)], [])
+
+                # The payload itself is unchanged in shape and still honest.
+                self.assertNotEqual(payload["network"]["scan_status"], "complete")
+                for category in ("cron", "files", "services", "auth_log"):
+                    self.assertIn(category, payload["unavailable"])
+
+                findings = security_scanner.collect_remote_windows(
+                    {"name": "WINDBOX"}, lambda inst, cmd: raw, config())
+                self.assertNotEqual(findings["network"]["scan_status"], "complete")
+                self.assertEqual(findings["network"]["risk"]["posture"], "incomplete")
+
+                # Host-derived text is markdown-escaped (SAFE-11); assert against
+                # what a Telegram client actually renders.
+                text = re.sub(r"\\([_*`\[\]])", r"\1",
+                              "\n".join(report(findings, "2026-09-29 12:00:00")))
+                for category in ("cron", "files", "services", "auth_log"):
+                    with self.subTest(denied_identities=count, category=category):
+                        self.assertIn(category, text)
+                gap_lines = [line for line in text.splitlines()
+                             if line.startswith("⚠️ Evidence gap:")]
+                self.assertLessEqual(len(gap_lines), llm_analyzer.MAX_RENDERED_GAPS)
+                # Duplicates collapse into one counted line; the budget is never
+                # spent on five identical lines.
+                repeated = [line for line in set(gap_lines) if gap_lines.count(line) > 1]
+                self.assertLessEqual(len(repeated), 1)
+                for line in repeated:
+                    self.assertIn("(repeated ", line)
+
+    def test_reg_12_every_windows_failure_shape_is_a_failed_scan(self):
+        """REG-12: SSH loss, a missing trailer, a nonzero trailer and junk all fail."""
+        good = json.dumps(self.payload()) + "\n__AURORA_SECURITY_EXIT__=0"
+        shapes = {
+            "ssh unreachable": None,
+            "missing trailer": json.dumps(self.payload()),
+            "nonzero trailer": json.dumps(self.payload()) + "\n__AURORA_SECURITY_EXIT__=3",
+            "unparsable payload": "not json at all",
+            "payload without network evidence": json.dumps({"processes": {}}),
+        }
+        for label, body in shapes.items():
+            with self.subTest(failure=label):
+                findings = self.collect(body)
+
+                self.assertIsNotNone(findings["error"])
+                self.assertEqual(findings["network"]["scan_status"], "failed")
+                self.assertEqual(findings["network"]["risk"]["posture"], "failed")
+                self.assertGreaterEqual(
+                    _risk_order(findings["network"]["risk"]["level"]), _risk_order("medium"))
+                self.assertTrue(security_scanner.has_any_findings(findings))
+        self.assertIsNone(self.collect(good)["error"])
+        self.assertEqual(self.collect(good)["network"]["risk"]["posture"], "complete")
 
 
 def _risk_order(level):

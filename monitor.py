@@ -5,6 +5,7 @@ import ipaddress
 import json
 import os
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -16,7 +17,12 @@ import requests
 import schedule
 from dotenv import load_dotenv
 
-from security_scanner import collect_local, collect_remote, has_any_findings
+from security_scanner import (
+    collect_local,
+    collect_remote_linux,
+    collect_remote_windows,
+    has_any_findings,
+)
 
 # ─── LOAD ENV ─────────────────────────────────────────────
 PH_TZ = ZoneInfo("Asia/Manila")
@@ -791,10 +797,19 @@ def cmd_logs(chat_id, inst):
 # ─── SECURITY COMMAND ─────────────────────────────────────
 
 def _collect_security_findings(inst):
-    """Scan one instance with its configured security identities."""
+    """
+    Scan one instance with its configured security identities.
+
+    Three-way dispatch on the host type: a local host is read with psutil, a
+    remote Windows host gets the Windows program, and every other remote host
+    gets the Linux program. The Windows collector emits the same raw evidence, so
+    the classification policy is the same on all three.
+    """
     if inst["is_local"]:
         return collect_local(inst["name"], inst.get("security"))
-    return collect_remote(inst, ssh_run, inst.get("security"))
+    if inst.get("is_windows"):
+        return collect_remote_windows(inst, ssh_run, inst.get("security"))
+    return collect_remote_linux(inst, ssh_run, inst.get("security"))
 
 
 def send_security_assessment(chat_id, inst, findings, timestamp):
@@ -855,24 +870,74 @@ def _call_security_model(findings):
     return llm_output, None
 
 
+# ─── ON-DEMAND /security GUARD ────────────────────────────
+# /security runs a full scan plus a Bedrock call, and the poll loop runs in a
+# daemon thread while the nightly job runs on the main thread, so two /security
+# requests really can overlap. At most one on-demand scan per (chat, instance) is
+# allowed in flight; a second one is refused immediately instead of doubling the
+# load. The nightly job is deliberately OUTSIDE this guard.
+_security_scans_in_flight = set()
+_security_scans_lock = threading.Lock()
+
+
+def _security_scan_key(chat_id, inst):
+    """
+    Identity of one scan target: the chat plus a STABLE instance identity.
+
+    The instance index is preferred over the display name, so two hosts that share
+    a display name can never silently share a guard slot.
+    """
+    identity = inst.get("index") if inst.get("index") is not None else inst.get("name")
+    return (str(chat_id), identity)
+
+
+def _claim_security_scan(key):
+    """Claim the slot without blocking; the poll loop must never stall on it."""
+    with _security_scans_lock:
+        if key in _security_scans_in_flight:
+            return False
+        _security_scans_in_flight.add(key)
+        return True
+
+
+def _release_security_scan(key):
+    with _security_scans_lock:
+        _security_scans_in_flight.discard(key)
+
+
 def cmd_security(chat_id, inst):
     """
     /security — On-demand security scan for this instance.
     Gathers structured evidence via psutil/SSH, sends the authoritative
     deterministic assessment, then the advisory Bedrock commentary.
+
+    The guard is released in a finally covering every exit path, so a failed
+    collector, formatter, model call or send can never leave the instance locked.
+    No lock is held while a scan, network call or model call runs.
     """
-    send_message(chat_id, f"🔍 *{inst['name']}* — Running security scan, please wait ~30s...")
+    key = _security_scan_key(chat_id, inst)
+    if not _claim_security_scan(key):
+        send_message(
+            chat_id,
+            f"⚠️ *{inst['name']}* — scan already running; this request was not started.",
+        )
+        return
+    try:
+        send_message(
+            chat_id, f"🔍 *{inst['name']}* — Running security scan, please wait ~30s...")
 
-    # 1. Collect findings
-    findings = _collect_security_findings(inst)
-    timestamp = now_ph().strftime("%Y-%m-%d %H:%M:%S")
+        # 1. Collect findings
+        findings = _collect_security_findings(inst)
+        timestamp = now_ph().strftime("%Y-%m-%d %H:%M:%S")
 
-    # 2. Authoritative assessment first, so it survives any model failure.
-    send_security_assessment(chat_id, inst, findings, timestamp)
+        # 2. Authoritative assessment first, so it survives any model failure.
+        send_security_assessment(chat_id, inst, findings, timestamp)
 
-    # 3. Advisory AI commentary
-    llm_output, llm_error = _call_security_model(findings)
-    send_security_advisory(chat_id, inst, timestamp, llm_output, llm_error)
+        # 3. Advisory AI commentary
+        llm_output, llm_error = _call_security_model(findings)
+        send_security_advisory(chat_id, inst, timestamp, llm_output, llm_error)
+    finally:
+        _release_security_scan(key)
 
 
 # ─── COMMAND ROUTER ───────────────────────────────────────
@@ -899,9 +964,142 @@ COMMANDS = {
 }
 
 
+# ─── DURABLE TELEGRAM UPDATE OFFSET ───────────────────────
+# Telegram replays any update that is still inside its retention window, so an
+# offset that only ever lived in memory re-executes commands after a restart. The
+# offset is persisted durably BEFORE the handler runs, so a crash mid-command can
+# only ever skip a command, never run one twice.
+
+_STATE_FILE_NAME = "telegram_offset.json"
+
+
+def _state_dir():
+    """
+    Resolve the state directory: explicit override, XDG, then the default.
+
+    The state directory is never inside the repository: a source checkout is not
+    a runtime data directory and its contents are tracked by version control.
+    """
+    override = os.getenv("MONITOR_BOT_STATE_DIR")
+    if override:
+        return override
+    xdg = os.getenv("XDG_STATE_HOME")
+    if xdg:
+        return os.path.join(xdg, "monitor_bot")
+    return os.path.join(os.path.expanduser("~"), ".local", "state", "monitor_bot")
+
+
+def _offset_path():
+    return os.path.join(_state_dir(), _STATE_FILE_NAME)
+
+
+def load_update_offset():
+    """
+    Return the persisted offset, or None when there is nothing usable yet.
+
+    A Telegram update_id is always a positive integer, so a non-positive value
+    (a hand-edited, truncated or corrupted file) is treated as absent rather than
+    as an offset: getUpdates treats offset <= 0 as "from the beginning" or
+    rejects it, which would either replay the whole retention window or wedge the
+    poll loop forever. Nothing is repaired or rewritten here.
+    """
+    try:
+        with open(_offset_path(), "r") as handle:
+            offset = int(str(handle.read()).strip())
+    except (OSError, ValueError, TypeError):
+        # A missing, empty or corrupt file is simply "no offset yet": it never
+        # blocks startup and never aborts the poll loop.
+        return None
+    return offset if offset > 0 else None
+
+
+def save_update_offset(value):
+    """
+    Persist the offset atomically with restrictive permissions.
+
+    A same-directory temp file is flushed and fsynced, then renamed over the
+    target, so a reader never sees a half-written offset. Every failure is
+    logged and swallowed: a command must still run when the state directory is
+    read-only, unwritable or full.
+    """
+    path = _offset_path()
+    directory = os.path.dirname(path) or "."
+    try:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        handle_fd, temporary = tempfile.mkstemp(
+            dir=directory, prefix=_STATE_FILE_NAME + ".", suffix=".tmp")
+        try:
+            os.fchmod(handle_fd, 0o600)
+            with os.fdopen(handle_fd, "w") as handle:
+                handle.write(str(int(value)))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+    except OSError as e:
+        print(f"[WARN] Could not persist the Telegram update offset: {e}")
+
+
+def _handle_update_batch(result, offset, progress=None):
+    """
+    Dispatch one getUpdates batch and return the next offset.
+
+    The offset is written for each accepted update BEFORE its handler runs, so
+    the durable state already covers an in-flight command. An update at or below
+    the current offset is a replay and is neither executed nor re-acknowledged.
+
+    `progress` is an optional mutable holder the CALLER owns. The helper writes
+    the advanced offset into it as soon as it is durable, so a handler that
+    raises cannot leave the caller holding a stale offset: the caller reads the
+    holder in its own `except`, and the next poll cannot replay an update whose
+    handler already ran. The offset is only ever raised, never lowered, so no
+    handler outcome can rewind it.
+    """
+    if progress is None:
+        progress = []
+    for update in result or []:
+        update_id = update["update_id"]
+        if offset is not None and update_id < offset:
+            continue
+        offset = update_id + 1
+        save_update_offset(offset)
+        progress.append(offset)
+
+        message = update.get("message", {})
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        text    = message.get("text", "").strip().lower()
+
+        if not chat_id or not text:
+            continue
+
+        inst = CHAT_TO_INSTANCE.get(chat_id)
+        if inst is None:
+            print(f"[IGNORED] Unknown chat_id: {chat_id}")
+            continue
+
+        base_cmd = text.split("@")[0]
+
+        if base_cmd in COMMANDS:
+            print(f"[CMD] update_id={update_id} {base_cmd} instance={inst['name']} "
+                  f"(chat {chat_id})")
+            COMMANDS[base_cmd](chat_id, inst)
+        else:
+            send_message(chat_id, "❓ Unknown command. Type /help for the list.")
+    return offset
+
+
 def handle_commands():
-    offset = None
-    print("[BOT] Listening for commands...")
+    offset = load_update_offset()
+    print("[BOT] Listening for commands... (offset=%s)" % offset)
+    # The holder survives a raising handler: the offset it carries is the highest
+    # already-persisted value, so a poll after the failure cannot replay an update
+    # whose handler already ran.
+    progress = []
     while True:
         try:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
@@ -909,29 +1107,12 @@ def handle_commands():
             response = requests.get(url, params=params, timeout=35)
             data = response.json()
 
-            for update in data.get("result", []):
-                offset = update["update_id"] + 1
-                message = update.get("message", {})
-                chat_id = str(message.get("chat", {}).get("id", ""))
-                text    = message.get("text", "").strip().lower()
-
-                if not chat_id or not text:
-                    continue
-
-                inst = CHAT_TO_INSTANCE.get(chat_id)
-                if inst is None:
-                    print(f"[IGNORED] Unknown chat_id: {chat_id}")
-                    continue
-
-                base_cmd = text.split("@")[0]
-
-                if base_cmd in COMMANDS:
-                    print(f"[CMD] {base_cmd} from {inst['name']} (chat {chat_id})")
-                    COMMANDS[base_cmd](chat_id, inst)
-                else:
-                    send_message(chat_id, "❓ Unknown command. Type /help for the list.")
+            offset = _handle_update_batch(data.get("result", []), offset, progress)
 
         except Exception as e:
+            if progress:
+                # Never rewind: the highest offset already persisted wins.
+                offset = max(x for x in (offset, progress[-1]) if x is not None)
             print(f"[ERROR] Polling error: {e}")
             time.sleep(5)
 
@@ -1135,6 +1316,9 @@ def main():
         else:
             mode = f"Linux SSH | user={inst['ssh_user']} | key={inst['key']}"
         print(f"  {inst['index']}. {inst['name']} ({inst['ip']}) → {mode} → chat {inst['chat_id']}")
+
+    print(f"[CONFIG] Restored Telegram update offset: {load_update_offset()} "
+          f"(state file: {_offset_path()})")
 
     # schedule.every(REPORT_INTERVAL).minutes.do(send_scheduled_reports)
     schedule.every(1).minutes.do(check_all_alerts)

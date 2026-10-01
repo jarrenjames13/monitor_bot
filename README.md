@@ -58,7 +58,8 @@ The CSV history remains primary-disk-only and retains its existing fields.
 ## Security scanning and network evidence
 
 `/security` and the nightly job collect the same structured evidence from local
-and SSH-remote Linux hosts. Each socket becomes a `network.observations` entry
+and SSH-remote hosts, on Linux and on Windows. Each socket becomes a
+`network.observations` entry
 with the protocol, local/remote address and port, connection state, the owning
 process (PID, name, executable, command line, user) and the Docker container
 publication when one can be proven, plus a `bind_scope`
@@ -84,6 +85,52 @@ concrete deviation is suspicious, `high` requires corroboration from another
 signal (suspicious process, temporary-directory binary, failed service, or auth
 log entries), and an incomplete or failed scan yields an unknown posture that is
 never presented as clean.
+
+### Windows hosts
+
+Set `INSTANCE_<N>_OS=windows` to select the Windows remote collector for that
+instance. That sends a Windows-native program (`powershell -NoProfile` queries and
+`psutil` only) and never the Linux program, which has no `systemctl`, cron spool,
+Linux auth log or Linux container CLI. Windows is a new collector, never a new
+policy: the same classification, direction, bind-scope, confidence and risk code
+runs on its output.
+
+A Windows host produces a **partial scan by design**. Concepts that have no
+Windows equivalent here — the Linux cron spool, the Linux sensitive-directory
+scan, systemd units, and an unelevated read of the Security event log — are
+reported in `findings["unavailable"]` by name rather than returned as an empty
+success, which forces `scan_status: "partial"` and an `incomplete` posture. The
+report always states which categories are unavailable, and a repeated per-item gap
+is collapsed into one counted line so a long list of identical denials cannot push
+that statement out of view.
+
+### What one Telegram message can carry
+
+There is exactly **one canonical evidence block**. The aggregate `Network summary`
+precedes it and reports totals for all observations; the detail block then renders
+each retained observation once, in adverse-first order. Per-classification display
+caps (`NEEDS_REVIEW_SHOWN`, `UNKNOWN_SHOWN`, and one pool shared by the verified
+classifications) bound what a message carries — they are **separate from evidence
+retention**. `findings["network"]["observations"]` keeps every observation, and the
+prompt, the authoritative assessment and the risk computation always use the full
+list whatever the display caps say. Every classification is always reported, with
+an explicit omitted count including `0 omitted`.
+
+The AI commentary is advisory only and is delivered after the assessment in
+separate chunks. Chunk 1 carries the timestamp and the rule; every continuation
+chunk repeats the instance, marks itself `2/N`, and repeats that advisory text
+cannot change the authoritative risk. No chunk can be read on its own as
+authoritative.
+
+### Durable update offset
+
+The Telegram `getUpdates` offset is persisted before a command's handler runs, so a
+crash mid-command can only skip a command, never run one twice. It is written
+atomically as `telegram_offset.json` in the state directory — mode `0600` inside a
+`0700` directory that is never inside the repository. Set `MONITOR_BOT_STATE_DIR`
+to choose it, otherwise `XDG_STATE_HOME/monitor_bot` is used, then
+`~/.local/state/monitor_bot`. A missing, empty, corrupt or non-positive stored
+offset is treated as absent rather than blocking the poll loop.
 
 ### Optional per-instance security identities
 

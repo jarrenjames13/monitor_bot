@@ -532,11 +532,210 @@ def _build_remote_command():
     )
 
 
+# ─── WINDOWS REMOTE COLLECTION (SSH) ───────────────────────
+# A Windows host has no systemctl, no cron, no Linux auth log and no Linux
+# container CLI, so the Linux program must never be sent to it. This program
+# emits the SAME raw observation shape the Linux and local collectors emit, so
+# the single classification policy below is shared by all three paths: Windows is
+# a new COLLECTOR, never a new POLICY. A Windows-only concept has no equivalent
+# here, and those categories are reported UNAVAILABLE rather than emulated, so a
+# partial Windows scan is never presented as clean.
+#
+# monitor.ssh_run discards the SSH exit status, so this program emits its own
+# __AURORA_SECURITY_EXIT__ trailer. That trailer is a SUCCESS MARKER: the program
+# always prints 0 once it has produced a payload. A partial or failed collection is
+# carried by the payload itself, never by the trailer — `scan_status: "partial"`
+# plus the gaps that name each unavailable category — and an SSH loss or an
+# unparsable/missing payload is reported by collect_remote_windows as a FAILED scan
+# via _fail_scan. A nonzero trailer therefore only ever arrives from a host running
+# something other than this program.
+_REMOTE_SCRIPT_WINDOWS = r'''import json, os, socket, subprocess
+from datetime import datetime
+import psutil
+
+SUSP_NAMES = {'nc','netcat','ncat','nmap','masscan','socat','xmrig','cgminer','minerd','ethminer','msfconsole','hydra','sqlmap','john','hashcat','mimikatz'}
+# A CONTAINMENT test, case-folded: a real Windows exe begins with a drive letter
+# (C:\Users\Administrator\AppData\Local\Temp\x.exe) or a UNC prefix
+# (\\host\share\AppData\Local\Temp\x.exe), never with a bare leading backslash, so
+# startswith could never match and this signal was permanently empty. Matching is on
+# the normalized (case-folded, slash-folded) string only; nothing is loosened beyond
+# these three roots and no Windows path is ever added as an allowlist entry.
+SUSP_PATHS = ['appdata\\local\\temp\\','windows\\temp\\','\\temp\\']
+SAFE_ZOMBIES = {'chrome','chromium','node','python'}
+
+findings = {
+    'os_type': 'windows',
+    'processes': {'high_cpu': [], 'high_mem': [], 'suspicious_name': [], 'suspicious_path': [], 'zombies': []},
+    'network': {'raw_observations': [], 'docker_containers': [], 'docker_status': 'not_applicable',
+                'scan_status': 'complete', 'scan_gaps': []},
+    'users': {'logged_in': []},
+    'files': {'recently_modified_system': []},
+    'services': {'failed': [], 'new_units': []},
+    'cron': {'entries': []},
+    'auth_log': [],
+    'unavailable': [],
+}
+
+UNAVAILABLE_DETAIL = {}
+
+def unavailable(category, detail):
+    """Record evidence this host cannot supply instead of returning a silent empty."""
+    UNAVAILABLE_DETAIL[category] = (UNAVAILABLE_DETAIL[category] + '; ' + detail
+                                    if category in UNAVAILABLE_DETAIL else detail)
+
+def powershell(argv, timeout=25):
+    """Run one Windows-native command with an argv list, never through a shell."""
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except Exception as exc:
+        return None, type(exc).__name__ + ': ' + str(exc)
+    if result.returncode != 0:
+        return None, (result.stderr or result.stdout or 'nonzero exit').strip()[:240]
+    return result.stdout, None
+
+def _base_name(path):
+    return os.path.basename(str(path or '').rstrip('\\/')) if path else ''
+
+process_map = {}
+# One denied process identity yields ONE counted gap, never one line per process:
+# N identical per-item lines would fill the report's entire 5-gap budget with
+# duplicate noise and push the named-unavailable statement out of view.
+DENIED_IDENTITIES = 0
+try:
+    for process in psutil.process_iter(['pid','ppid','name','exe','cmdline','username','cpu_percent','memory_percent','status']):
+        try:
+            i = process.info
+            pid = i.get('pid')
+            name = i.get('name') or ''
+            exe = i.get('exe') or ''
+            user = i.get('username') or ''
+            process_map[pid] = {'pid': pid, 'ppid': i.get('ppid'), 'name': name or 'unknown',
+                                'exe': exe or 'unknown', 'cmdline': i.get('cmdline') or [],
+                                'user': user or 'unknown', 'parent_exe': 'unknown'}
+            cpu = i.get('cpu_percent') or 0
+            mem = i.get('memory_percent') or 0
+            if (i.get('status') or '') == 'zombie' and not any(z in name.lower() for z in SAFE_ZOMBIES):
+                findings['processes']['zombies'].append({'pid': pid, 'name': name})
+            if cpu >= 50:
+                findings['processes']['high_cpu'].append({'pid': pid, 'name': name, 'cpu': round(cpu, 1), 'user': user, 'exe': exe})
+            if mem >= 30:
+                findings['processes']['high_mem'].append({'pid': pid, 'name': name, 'mem': round(mem, 1), 'user': user, 'exe': exe})
+            if name.lower() in SUSP_NAMES:
+                findings['processes']['suspicious_name'].append({'pid': pid, 'name': name, 'exe': exe, 'user': user})
+            lowered = exe.lower().replace('/', '\\')
+            if exe and any(root.lower() in lowered for root in SUSP_PATHS):
+                findings['processes']['suspicious_path'].append({'pid': pid, 'name': name, 'exe': exe, 'user': user})
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            DENIED_IDENTITIES += 1
+        except Exception as exc:
+            findings['network']['scan_gaps'].append('Process identity lookup failed: ' + type(exc).__name__)
+except Exception as exc:
+    findings['network']['scan_gaps'].append('Process enumeration failed: ' + type(exc).__name__ + ': ' + str(exc))
+    unavailable('processes', 'process enumeration failed: ' + type(exc).__name__ + ': ' + str(exc))
+if DENIED_IDENTITIES:
+    findings['network']['scan_gaps'].append(
+        '%d process identity field(s) were inaccessible without elevation' % DENIED_IDENTITIES)
+for owner in process_map.values():
+    parent = process_map.get(owner.get('ppid'))
+    if parent:
+        owner['parent_exe'] = parent.get('exe') or 'unknown'
+
+connections = []
+try:
+    for conn in psutil.net_connections(kind='inet'):
+        try:
+            def parts(address):
+                if not address:
+                    return None, None
+                if isinstance(address, (tuple, list)):
+                    return (str(address[0]) if address else None), (address[1] if len(address) > 1 else None)
+                return getattr(address, 'ip', None), getattr(address, 'port', None)
+            local_ip, local_port = parts(conn.laddr)
+            remote_ip, remote_port = parts(conn.raddr)
+            conn_type = getattr(conn, 'type', None)
+            protocol = 'tcp' if conn_type == socket.SOCK_STREAM else ('udp' if conn_type == socket.SOCK_DGRAM else 'unknown')
+            state = str(getattr(conn, 'status', '') or 'UNKNOWN')
+            is_listener = state == 'LISTEN' or (protocol == 'udp' and local_ip is not None and remote_ip is None)
+            pid = getattr(conn, 'pid', None)
+            owner = process_map.get(pid, {'pid': pid, 'ppid': None, 'name': 'unknown', 'exe': 'unknown',
+                                          'cmdline': [], 'user': 'unknown', 'parent_exe': 'unknown'})
+            connections.append({'protocol': protocol, 'local_ip': local_ip,
+                'local_port': local_port, 'remote_ip': remote_ip, 'remote_port': remote_port,
+                'state': state, 'is_listener': is_listener, 'pid': pid, 'owner': owner})
+        except Exception as exc:
+            findings['network']['scan_gaps'].append('Socket record unavailable: ' + type(exc).__name__)
+except Exception as exc:
+    unavailable('network', 'socket enumeration needs elevation: ' + type(exc).__name__ + ': ' + str(exc))
+findings['network']['raw_observations'] = connections
+
+# Windows has no Linux cron spool and no Linux container CLI contract here; neither
+# is emulated, and neither is reported as an empty success.
+findings['network']['docker_containers'] = []
+findings['network']['docker_status'] = 'not_applicable'
+unavailable('cron', 'no Linux cron spool exists on this host; Windows scheduled tasks are not collected by this scanner')
+unavailable('files', 'the Linux sensitive-directory scan has no Windows equivalent; the Windows system directory is not walked')
+unavailable('services', 'systemd units do not exist on this host; Windows service state is collected instead')
+
+out, failure = powershell(['powershell', '-NoProfile', '-NonInteractive', '-Command',
+    "Get-Service | Where-Object { $_.Status -ne 'Running' } | "
+    "Select-Object -ExpandProperty Name"])
+if failure is not None:
+    unavailable('services', 'Get-Service failed: ' + failure)
+else:
+    findings['services']['failed'] = [line.strip() for line in out.splitlines() if line.strip()][:20]
+
+event_failures = []
+for event_id in (4624, 4625, 4720, 4726):
+    out, failure = powershell(['powershell', '-NoProfile', '-NonInteractive', '-Command',
+        "(Get-WinEvent -FilterHashtable @{LogName='Security'; Id=%d} -MaxEvents 25 "
+        "-ErrorAction Stop | Select-Object -First 25 | "
+        "ForEach-Object { $_.TimeCreated.ToString() + ' ' + $_.Id + ' ' + "
+        "($_.Message -replace \"`r|`n\", ' ') })" % event_id], timeout=30)
+    if failure is not None:
+        event_failures.append('%d: %s' % (event_id, failure))
+    else:
+        findings['auth_log'].extend(line.strip() for line in out.splitlines() if line.strip())
+findings['auth_log'] = findings['auth_log'][:50]
+if event_failures:
+    unavailable('auth_log', 'the Security event log could not be read without elevation (' + ' | '.join(event_failures) + ')')
+
+try:
+    for user in psutil.users():
+        findings['users']['logged_in'].append({'name': user.name, 'terminal': getattr(user, 'terminal', None),
+            'host': getattr(user, 'host', None), 'started': str(datetime.fromtimestamp(user.started))})
+except Exception as exc:
+    unavailable('users', 'logged-in user enumeration is unavailable: ' + type(exc).__name__ + ': ' + str(exc))
+
+findings['unavailable'] = sorted(UNAVAILABLE_DETAIL)
+if UNAVAILABLE_DETAIL:
+    # One human-readable gap covers the whole unavailability set, so the report's
+    # 5-gap render cap cannot hide one category behind another.
+    findings['network']['scan_gaps'].append(
+        'Windows evidence unavailable: ' + ' | '.join(
+            category + ' (' + detail + ')' for category, detail in sorted(UNAVAILABLE_DETAIL.items())))
+if findings['network']['scan_gaps']:
+    findings['network']['scan_status'] = 'partial'
+print(json.dumps(findings))
+print('__AURORA_SECURITY_EXIT__=0')
+'''
+
+
+def _build_remote_command_windows():
+    """
+    The Windows SSH command: static text, one interpreter, no shell syntax.
+
+    There is no `; exit "$rc"` here because monitor.ssh_run returns stdout only
+    and throws the SSH exit status away, so the program prints its own trailer.
+    """
+    encoded = base64.b64encode(_REMOTE_SCRIPT_WINDOWS.encode("utf-8")).decode("ascii")
+    return "python -c \"exec(__import__('base64').b64decode('" + encoded + "'))\""
+
+
 # Kept as a module-level name for callers/tests that referenced the old constant.
 _REMOTE_PYTHON = _build_remote_command()
 
 
-def collect_remote(inst: dict, ssh_run_fn, security_config: dict | None = None) -> dict:
+def collect_remote_linux(inst: dict, ssh_run_fn, security_config: dict | None = None) -> dict:
     """
     Gather structured Linux evidence from a remote instance via the caller's SSH runner.
     Empty, invalid, or nonzero remote responses are reported as failed scans.
@@ -599,6 +798,87 @@ def collect_remote(inst: dict, ssh_run_fn, security_config: dict | None = None) 
         network.pop("raw_observations", []),
         network.pop("docker_containers", []),
         network.get("docker_status", "unavailable"),
+        network.get("scan_gaps", []),
+        security_config or {},
+        network.get("scan_status", "unknown"),
+    )
+    return findings
+
+
+# Plain module-level alias, NOT a wrapper: callers and tests that still patch or
+# call `collect_remote` reach the very same function object as
+# `collect_remote_linux`.
+collect_remote = collect_remote_linux
+
+
+def collect_remote_windows(inst: dict, ssh_run_fn, security_config: dict | None = None) -> dict:
+    """
+    Gather structured evidence from a remote Windows instance via SSH.
+
+    The Windows program emits the same raw observation shape as the Linux one, so
+    the classification, risk and legacy projections below are the unchanged
+    central policy. Categories this collector cannot reach on Windows are
+    reported as unavailable, which forces an incomplete posture rather than a
+    clean one.
+    """
+    findings = _base_findings(inst["name"], "remote")
+    output = ssh_run_fn(inst, _build_remote_command_windows())
+
+    if output is None:
+        _fail_scan(findings, "SSH unreachable", security_config)
+        return findings
+
+    response = str(output)
+    exit_code = None
+    if _EXIT_TRAILER in response:
+        response, _, trailer = response.rpartition(_EXIT_TRAILER)
+        exit_code = trailer.strip().splitlines()[0].strip() if trailer.strip() else ""
+    if exit_code != "0":
+        message = (
+            "Remote security scanner exited nonzero"
+            if exit_code
+            else "Remote security scanner response is missing its exit status"
+        )
+        remote_data = _parse_remote_payload(response)
+        if remote_data is None:
+            _fail_scan(findings, message, security_config)
+            return findings
+        # A failed scan that still returned evidence keeps that evidence.
+        for section, value in remote_data.items():
+            findings[section] = value
+        network = findings.get("network", {})
+        _finalize_network(
+            findings,
+            network.pop("raw_observations", []),
+            network.pop("docker_containers", []),
+            network.get("docker_status", "not_applicable"),
+            [message] + list(network.get("scan_gaps", [])),
+            security_config or {},
+            "failed",
+        )
+        findings["error"] = message
+        return findings
+
+    try:
+        remote_data = _parse_remote_payload(response)
+        if remote_data is None:
+            raise ValueError("scanner response is missing its network evidence")
+    except Exception as exc:
+        _fail_scan(
+            findings, f"Invalid remote security response: {type(exc).__name__}: {exc}",
+            security_config,
+        )
+        return findings
+
+    for section, value in remote_data.items():
+        findings[section] = value
+
+    network = findings.get("network", {})
+    _finalize_network(
+        findings,
+        network.pop("raw_observations", []),
+        network.pop("docker_containers", []),
+        network.get("docker_status", "not_applicable"),
         network.get("scan_gaps", []),
         security_config or {},
         network.get("scan_status", "unknown"),

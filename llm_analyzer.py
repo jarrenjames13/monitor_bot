@@ -38,10 +38,20 @@ MAX_TELEGRAM_CHUNK = 4000
 # Telegram rejects any sendMessage body longer than this with HTTP 400. Nothing
 # handed to send_message may be longer, including whatever prefix is prepended.
 TELEGRAM_MAX_MESSAGE = 4096
-# Budget for the lower-priority (expected/informational) evidence only. Adverse
-# observations are never dropped to stay inside it.
-MAX_OBSERVATION_LINES = 60
-MAX_OMITTED_ADVERSE_LISTED = 10
+
+# ─── DISPLAY CAPS FOR THE TELEGRAM EVIDENCE BLOCK ─────────
+# These are PRESENTATION budgets only. They bound how much evidence one message
+# can carry; they never bound the evidence itself. `findings["network"]
+# ["observations"]`, the prompt, the authoritative assessment and the risk
+# computation always use the FULL observation list, whatever these say.
+#
+# high_risk and suspicious are deliberately uncapped: a confirmed deviation must
+# never be dropped to stay inside a display budget.
+NEEDS_REVIEW_SHOWN = 25
+UNKNOWN_SHOWN = 15
+# expected -> informational -> benign share one pool, allocated in that order, so
+# the verified remainder can never crowd out the unresolved one.
+VERIFIED_SHOWN = 10
 
 RISK_ORDER = ["negligible", "low", "medium", "high", "critical"]
 RISK_ICONS = {
@@ -52,14 +62,30 @@ VERIFIED_CATEGORIES = ("expected", "informational", "benign")
 # bind_scope values that make a socket reachable from outside the host.
 EXPOSED_BIND_SCOPES = ("all-interfaces", "public-interface", "unknown")
 
-SECTION_TITLES = (
-    "Suspicious / Requires Review",
-    "Expected Network Activity",
-    "Externally Exposed Listeners",
-    "Local-Only Listeners",
-    "Outbound Connections",
-    "Inbound Connections",
+# The report renders exactly ONE detailed evidence block, so every observation is
+# printed at most once, in the order _ordered_observations produces.
+SECTION_TITLES = ("Network evidence",)
+SUMMARY_TITLE = "Network summary"
+
+# Fixed report order for the per-classification cap lines; every classification is
+# always reported, including the ones with nothing to show.
+CATEGORY_LABELS = (
+    ("high_risk", "High risk"),
+    ("suspicious", "Suspicious"),
+    ("needs_review", "Needs review"),
+    ("unknown", "Unknown"),
+    ("expected", "Expected"),
+    ("informational", "Informational"),
+    ("benign", "Benign"),
 )
+# The classifications that are never truncated for display. Anything NOT listed
+# here — including a classification introduced later — is bounded by CATEGORY_CAPS.
+UNCAPPED_CATEGORIES = ("high_risk", "suspicious")
+# The cap for each bounded classification.
+CATEGORY_CAPS = {
+    "needs_review": NEEDS_REVIEW_SHOWN,
+    "unknown": UNKNOWN_SHOWN,
+}
 AUTH_FAILURE_WORDS = (
     "failed", "invalid", "refused", "error", "useradd", "userdel", "passwd",
     "authentication failure", "unable to authenticate", "sudo:",
@@ -317,8 +343,10 @@ def _observation_line(observation, with_reason=False, for_markdown=False):
         field(observation.get("protocol") or "protocol unknown"), field(endpoint),
         field(remote or "-"), field(observation.get("direction", "?")),
     )
-    extras = ["state=%s pid=%s" % (field(observation.get("state", "UNKNOWN")),
-                                   field(observation.get("pid", "unknown")))]
+    extras = ["state=%s pid=%s listener=%s" % (
+        field(observation.get("state", "UNKNOWN")),
+        field(observation.get("pid", "unknown")),
+        "yes" if observation.get("is_listener") else "no")]
     evidence = observation.get("evidence") or {}
     if evidence.get("matched_destination"):
         extras.append("matched-destination=%s" % field(evidence["matched_destination"]))
@@ -358,6 +386,67 @@ def _category_marker(category):
     }.get(category, "•")
 
 
+# The Telegram gap block carries at most this many gap lines, so a host that reports
+# the same per-item gap a dozen times cannot use the whole budget on identical noise
+# and hide a distinct statement. The line naming the unavailable categories is
+# reserved inside this same budget, never in addition to it.
+MAX_RENDERED_GAPS = 5
+
+
+def _unavailable_statement(unavailable):
+    """
+    One bounded line naming every category the collector declared unavailable.
+
+    Built from the authoritative `findings["unavailable"]` list, so it is always
+    complete: it names each category rather than reproducing a prose detail that
+    a length limit could cut off mid-list.
+    """
+    names = [str(name).strip() for name in (unavailable or []) if str(name).strip()]
+    if not names:
+        return None
+    return "⚠️ Evidence unavailable on this host: %s" % escape_markdown(", ".join(names))
+
+
+def _evidence_gap_lines(scan_gaps, unavailable=()):
+    """
+    Render the evidence gaps, deduplicated, with the unavailability statement last.
+
+    Two rules, both required by INV-REV-WIN-001:
+
+    1. The statement naming the unavailable categories is ALWAYS rendered, and
+       LAST, so it survives the budget no matter how many per-item gaps precede it.
+    2. Repeated identical per-item gaps collapse into one counted line, so N denied
+       process identities cost one line plus a count instead of N lines. A gap that
+       is itself an unavailability statement keeps a reserved slot.
+
+    `scan_gaps` itself is never mutated: the findings dict and every other consumer
+    (the risk reasons, the prompt) keep the original list and its ordering, and the
+    total number of rendered gap lines never exceeds MAX_RENDERED_GAPS.
+    """
+    gaps = [str(gap) for gap in (scan_gaps or []) if str(gap).strip()]
+    counts, order = {}, []
+    for gap in gaps:
+        if gap not in counts:
+            counts[gap] = 0
+            order.append(gap)
+        counts[gap] += 1
+
+    statement = _unavailable_statement(unavailable)
+    budget = MAX_RENDERED_GAPS - (1 if statement else 0)
+    lines = []
+    for gap in order:
+        if len(lines) >= budget:
+            break
+        repeat = counts[gap]
+        detail = escape_markdown(gap[:200])
+        if repeat > 1:
+            detail = "%s (repeated %d times)" % (detail, repeat)
+        lines.append("⚠️ Evidence gap: %s" % detail)
+    if statement:
+        lines.append(statement)
+    return lines
+
+
 def _legacy_endpoint(observation):
     if observation.get("addr"):
         return observation["addr"]
@@ -376,76 +465,105 @@ def _ordered_observations(observations):
     )
 
 
-def _observation_endpoint(observation):
-    """Short, stable identity of one observation, used to enumerate omissions."""
-    if observation.get("local"):
-        endpoint = observation["local"]
-    elif observation.get("local_ip") or observation.get("local_port"):
-        endpoint = "%s:%s" % (observation.get("local_ip"), observation.get("local_port"))
-    else:
-        endpoint = _legacy_endpoint(observation)
-    remote = observation.get("remote")
-    if not remote and observation.get("remote_ip"):
-        remote = "%s:%s" % (observation.get("remote_ip"), observation.get("remote_port"))
-    return "%s %s %s" % (observation.get("protocol") or "protocol unknown", endpoint,
-                        remote or "-")
+
+
+
+def _empty_category_accounting():
+    """Per-classification totals for all seven classifications, always present."""
+    return {name: {"total": 0, "shown": 0, "omitted": 0}
+            for name, _label in CATEGORY_LABELS}
 
 
 def _select_observations(observations):
     """
-    Choose what the report can carry.
+    Choose what one Telegram message can carry, and account for the rest.
 
-    Adverse evidence (suspicious, high_risk, needs_review, unknown) is always
-    shown: MAX_OBSERVATION_LINES is a budget for the expected/informational
-    remainder only. Returns (shown, omitted, omitted_adverse) in the same
-    adverse-first order, so the caller can describe exactly what it left out.
+    One pass over _ordered_observations(), which already orders adverse evidence
+    first and preserves the collection index as the tie-break, so the selection is
+    exactly a prefix of the rendered order. high_risk and suspicious are never
+    capped; needs_review and unknown have their own caps; expected,
+    informational and benign share one pool that is allocated in that order; and a
+    classification the caps were never configured for is bounded, never uncapped.
+
+    Returns a DICT so the numbers cannot be mis-ordered by a caller:
+      shown      — the (index, observation) pairs that are rendered, in order
+      omitted    — the pairs that are not, in the same order
+      categories — {name: {"total", "shown", "omitted"}} for all seven
+      totals     — {"observations", "rendered", "omitted"}
+
+    Only the DISPLAY selection is bounded here. The findings dict, the prompt,
+    the assessment and the risk computation always use the full list.
     """
-    ordered = _ordered_observations(observations)
-    adverse = [pair for pair in ordered
-               if pair[1].get("classification") in ADVERSE_CATEGORIES]
-    lower_priority = [pair for pair in ordered
-                      if pair[1].get("classification") not in ADVERSE_CATEGORIES]
-    budget = max(0, MAX_OBSERVATION_LINES - len(adverse))
-    kept = {pair[0] for pair in adverse} | {pair[0] for pair in lower_priority[:budget]}
-    shown = [pair for pair in ordered if pair[0] in kept]
-    omitted = [pair for pair in ordered if pair[0] not in kept]
-    omitted_adverse = [pair for pair in adverse if pair[0] not in kept]
-    return shown, omitted, omitted_adverse
+    categories = _empty_category_accounting()
+    shown, omitted = [], []
+    total = 0
+    pool = VERIFIED_SHOWN
+    for pair in _ordered_observations(observations):
+        classification = pair[1].get("classification") or "unknown"
+        entry = categories.setdefault(
+            classification, {"total": 0, "shown": 0, "omitted": 0})
+        total += 1
+        entry["total"] += 1
+        if classification in VERIFIED_CATEGORIES:
+            keep = pool > 0
+            if keep:
+                pool -= 1
+        elif classification in UNCAPPED_CATEGORIES:
+            # high_risk and suspicious are deliberately uncapped: a confirmed
+            # deviation is never dropped to stay inside a display budget.
+            keep = True
+        else:
+            # An unknown classification is a FUTURE classification the caps were
+            # never configured for. It is never treated as uncapped: an eighth
+            # classification would otherwise bypass every display budget AND gain an
+            # eighth accounting entry. It shares the verified pool instead, so it
+            # stays bounded and stays accounted.
+            cap = CATEGORY_CAPS.get(classification, UNKNOWN_SHOWN)
+            keep = entry["shown"] < cap
+        if keep:
+            entry["shown"] += 1
+            shown.append(pair)
+        else:
+            entry["omitted"] += 1
+            omitted.append(pair)
+    return {
+        "shown": shown,
+        "omitted": omitted,
+        "categories": categories,
+        "totals": {
+            "observations": total,
+            "rendered": len(shown),
+            "omitted": len(omitted),
+        },
+    }
 
 
-def _section_members(shown):
+def _network_summary(assessment, observations, selection):
     """
-    Partition the shown observations into the operator-facing sections.
+    Aggregate view over ALL collected observations, before the detail block.
 
-    This is a pure view: nothing is reclassified and nothing is dropped. An
-    observation may appear in more than one section (for example a verified
-    loopback collector is both expected activity and a local-only listener).
-    Inbound is never projected into outbound, and a listener that is reachable
-    from outside the host is never listed as expected activity.
+    Nothing here is capped: the direction and listener totals and the
+    per-classification totals come from the full observation list, so the summary
+    can never be read as a claim about less evidence than was collected.
     """
-    members = {title: [] for title in SECTION_TITLES}
-    undecided = []
-    for pair in shown:
-        observation = pair[1]
-        classification = observation.get("classification")
-        bind_scope = observation.get("bind_scope")
-        listener = bool(observation.get("is_listener"))
-        direction = observation.get("direction")
-        if classification in ADVERSE_CATEGORIES:
-            members["Suspicious / Requires Review"].append(pair)
-        if classification in VERIFIED_CATEGORIES and bind_scope not in EXPOSED_BIND_SCOPES:
-            members["Expected Network Activity"].append(pair)
-        if listener:
-            members["Externally Exposed Listeners" if bind_scope in EXPOSED_BIND_SCOPES
-                    else "Local-Only Listeners"].append(pair)
-        if direction == "outbound":
-            members["Outbound Connections"].append(pair)
-        elif direction == "inbound":
-            members["Inbound Connections"].append(pair)
-        elif not listener:
-            # Never dropped, never given a direction it does not have.
-            undecided.append(pair)
-    return members, undecided
+    listeners = [item for item in observations if item.get("is_listener")]
+    local_only = sum(
+        1 for item in listeners if item.get("bind_scope") not in EXPOSED_BIND_SCOPES)
+    directions = assessment["directions"]
+    lines = [
+        "\n🌐 *%s* — %d observation(s)" % (
+            SUMMARY_TITLE, selection["totals"]["observations"]),
+        "Direction: Inbound %d · Outbound %d · Uncertain %d" % (
+            directions["inbound"], directions["outbound"], directions["uncertain"]),
+        "Listeners: %d total — Local-only %d · Externally reachable %d" % (
+            len(listeners), local_only, len(listeners) - local_only),
+    ]
+    for name, label in CATEGORY_LABELS:
+        entry = selection["categories"][name]
+        lines.append(
+            "%s: %d total — showing %d, %d omitted from Telegram output." % (
+                label, entry["total"], entry["shown"], entry["omitted"]))
+    return "\n".join(lines)
 
 
 def _render_observation(observation):
@@ -502,60 +620,31 @@ def format_assessment(findings: dict, timestamp: str | None = None) -> list[str]
 
     network = findings.get("network") or {}
     if observations:
-        shown, omitted, omitted_adverse = _select_observations(observations)
-        members, undecided = _section_members(shown)
-        total = assessment["totals"].get("observations", len(observations))
-        adverse_total = assessment["adverse"]
+        selection = _select_observations(observations)
+        lines.append(_network_summary(assessment, observations, selection))
+        totals = selection["totals"]
         lines.append(
-            "\n🌐 *Network evidence* — %d observation(s)%s\n"
+            "\n🌐 *%s* — %d of %d observation(s) shown\n"
             "Categories: %s\n"
             "Directions: inbound %s · outbound %s · uncertain %s"
-            % (total,
-               ", %d omitted for length" % len(omitted) if omitted else "",
+            % (SECTION_TITLES[0], totals["rendered"], totals["observations"],
                escape_markdown(_category_summary(assessment["categories"])),
                assessment["directions"]["inbound"], assessment["directions"]["outbound"],
                assessment["directions"]["uncertain"])
         )
-        for title in SECTION_TITLES:
-            entries = members[title]
-            lines.append("\n*%s* — %d item(s)" % (title, len(entries)))
-            if not entries:
-                lines.append("  (none)")
-            for _, observation in entries:
-                lines.extend(_render_observation(observation))
+        undecided = 0
+        for _index, observation in selection["shown"]:
+            if not observation.get("is_listener") and not observation.get("direction"):
+                undecided += 1
+            lines.extend(_render_observation(observation))
         if undecided:
             lines.append(
-                "\n⚠️ Direction not established — %d socket(s) are listed above without an "
-                "outbound or inbound section:" % len(undecided))
-            for _, observation in undecided:
-                lines.extend(_render_observation(observation))
-        if omitted:
-            lines.append(
-                "⚠️ Truncated for message length: %d of %d observation(s) not shown "
-                "(%d expected/informational, %d review/unknown, %d suspicious/high-risk)."
-                % (len(omitted), total, len(omitted) - len(omitted_adverse),
-                   len([pair for pair in omitted_adverse
-                        if pair[1].get("classification") in ("needs_review", "unknown")]),
-                   len([pair for pair in omitted_adverse
-                        if pair[1].get("classification") in ("suspicious", "high_risk")])))
-        if len(shown) > MAX_OBSERVATION_LINES:
-            lines.append(
-                "⚠️ The adverse evidence alone exceeds the %d-line display budget; "
-                "%d adverse item(s) were shown anyway so none is hidden."
-                % (MAX_OBSERVATION_LINES, assessment["adverse"]))
-        if omitted or omitted_adverse:
-            lines.append(
-                "⚠️ Adverse omissions: %d of %d adverse observation(s) not shown%s"
-                % (len(omitted_adverse), adverse_total,
-                   " — " + ", ".join(
-                       escape_markdown(_observation_endpoint(pair[1]))
-                       for pair in omitted_adverse[:MAX_OMITTED_ADVERSE_LISTED])
-                   + (" …" if len(omitted_adverse) > MAX_OMITTED_ADVERSE_LISTED else "")
-                   if omitted_adverse else ""))
-        for gap in (network.get("scan_gaps") or [])[:5]:
-            lines.append("⚠️ Evidence gap: %s" % escape_markdown(str(gap)[:200]))
+                "⚠️ Direction not established — %d socket(s) above carry no outbound or "
+                "inbound direction; they are never given one." % undecided)
+        lines.extend(_evidence_gap_lines(
+            network.get("scan_gaps"), findings.get("unavailable") or ()))
     else:
-        lines.append("\n🌐 *Network evidence* — no socket evidence was collected.")
+        lines.append("\n🌐 *%s* — no socket evidence was collected." % SECTION_TITLES[0])
 
     non_network = assessment["non_network"]
     lines.append(
@@ -609,20 +698,47 @@ def _qualify_model_rating(text):
     return "\n".join(qualified)
 
 
+def _advisory_continuation_header(inst_name, index, total):
+    """
+    Short header for advisory chunk 2..N.
+
+    Only chunk 1 carries the timestamp and the horizontal rule. Every later chunk
+    still names the instance, marks itself as advisory, says which part of the
+    commentary it is, and repeats the sentence that the text cannot change the
+    authoritative risk, so no chunk can be read on its own as authoritative.
+    """
+    return (
+        f"🤖 *AI Security Commentary* (advisory only) — continued {index}/{total}\n"
+        f"🖥️ Instance: `{escape_markdown(inst_name)}`\n"
+        "⚠️ Advisory text cannot lower or raise the authoritative risk shown above.\n"
+    )
+
+
 def format_advisory(inst_name: str, llm_output: str, timestamp: str) -> list[str]:
     """Chunks for the Bedrock commentary, clearly marked advisory."""
     if not str(llm_output).strip():
         return ["ℹ️ No AI commentary was returned. The authoritative assessment above stands."]
     banner = (
-        f"🤖 *AI commentary — advisory only*\n"
+        f"🤖 *AI Security Commentary — advisory only*\n"
         f"🖥️ Instance: `{escape_markdown(inst_name)}`\n"
         f"🕐 {escape_markdown(timestamp)}\n"
         "⚠️ Advisory text cannot lower or raise the authoritative risk shown above.\n"
         f"{'─' * 38}\n"
     )
-    # The banner rides on every chunk, so it is budgeted inside the split.
-    return format_telegram_report(
+    # The split reserves the LONGEST header any chunk can carry, so a continuation
+    # chunk can never be pushed over the Telegram limit by its own header.
+    chunks = format_telegram_report(
         inst_name, _qualify_model_rating(llm_output), timestamp, prefix=banner)
+    total = len(chunks)
+    if total < 2:
+        return chunks
+    # format_telegram_report cannot know how many chunks there will be, so it
+    # repeats the banner; swap that copy for the short continuation header.
+    return [chunks[0]] + [
+        _advisory_continuation_header(inst_name, index + 1, total)
+        + (chunk[len(banner):] if chunk.startswith(banner) else chunk)
+        for index, chunk in enumerate(chunks[1:], start=1)
+    ]
 
 
 # ─── PROMPT BUILDER ───────────────────────────────────────
