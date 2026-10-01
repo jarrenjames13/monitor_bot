@@ -1382,6 +1382,22 @@ class RegWindowsTransportTests(unittest.TestCase):
         self.assertEqual(security_scanner._build_remote_command_windows(),
                          security_scanner._build_remote_command_windows())
 
+    def test_reg_win_transport_1_the_gzip_header_carries_no_build_time(self):
+        """
+        REG-REV-WIN-TRANSPORT-1 — determinism is asserted in the bytes.
+
+        Comparing two commands built in the same process proves nothing about the
+        timestamp: gzip's MTIME field has one-second resolution, so two calls in
+        one second agree even with a wall clock value, and on this CPython
+        `gzip.compress(data, 9)` already writes zero on its own. The header is
+        read directly instead, so the assertion fails on ANY interpreter if the
+        build time ever comes back.
+        """
+        raw = base64.b64decode(self.payload(security_scanner._build_remote_command_windows()))
+
+        self.assertEqual(raw[:3], b"\x1f\x8b\x08")
+        self.assertEqual(int.from_bytes(raw[4:8], "little"), 0)
+
     def test_reg_win_transport_1_the_linux_transport_is_untouched(self):
         """REG-WIN-TRANSPORT-1 (preservation guard): Linux is byte-identical."""
         self.assertEqual(security_scanner._build_remote_command(), PINNED_LINUX_COMMAND)
@@ -1717,6 +1733,14 @@ class RegWindowsEmptyOutputTests(unittest.TestCase):
         return security_scanner.collect_remote_windows(
             {"name": "WINDBOX"}, lambda inst, cmd: body, config())
 
+    def collect_detailed(self, result):
+        return security_scanner.collect_remote_windows(
+            {"name": "WINDBOX"}, lambda inst, cmd: result, config())
+
+    def detailed(self, stdout="", stderr="", exit_status=None):
+        """The shape production passes: `monitor.ssh_run_detailed`'s own result."""
+        return monitor.SSHResult(stdout, stderr, exit_status, False)
+
     def assert_fail_closed(self, findings):
         self.assertIsNotNone(findings["error"])
         self.assertEqual(findings["network"]["scan_status"], "failed")
@@ -1770,6 +1794,48 @@ class RegWindowsEmptyOutputTests(unittest.TestCase):
         self.assertIsNone(findings["error"])
         self.assertEqual(findings["network"]["scan_status"], "complete")
         self.assertEqual(findings["network"]["risk"]["posture"], "complete")
+
+    def test_reg_win_diag_3_the_production_runner_keeps_the_missing_trailer_wording(self):
+        """
+        REG-REV-WIN-DIAG-003 — the wording production actually emits, pinned.
+
+        Every other exact-equality assertion here uses a plain str-or-None
+        runner, but `monitor._collect_security_findings` always passes
+        `ssh_run_detailed` for Windows, so the message an operator reads was
+        never pinned. On that path a missing trailer gains a `: <reason>` suffix
+        when stderr is non-empty, and that suffix was unbounded; the bound below
+        is the fixed wording plus the cap.
+        """
+        body = json.dumps(self.GOOD_PAYLOAD)
+        wording = "Remote security scanner response is missing its exit status"
+        bound = len(f"{wording}: ") + security_scanner._REMOTE_DIAGNOSTIC_CAP
+
+        # A valid payload, no trailer, and something for the remote to have said.
+        findings = self.collect_detailed(
+            self.detailed(body, stderr="SyntaxError: invalid syntax", exit_status=0))
+
+        self.assertEqual(findings["error"],
+                         f"{wording}: SyntaxError: invalid syntax")
+        self.assertLessEqual(len(findings["error"]), bound)
+        self.assert_fail_closed(findings)
+
+        # Nothing said, nothing appended: no invented colon-space.
+        silent = self.collect_detailed(self.detailed(body, exit_status=0))
+
+        self.assertEqual(silent["error"], wording)
+        self.assertLessEqual(len(silent["error"]), bound)
+        self.assert_fail_closed(silent)
+
+        # A loud remote cannot grow the message past the bound, and the wording
+        # it is reported under is still the missing-trailer one.
+        loud = self.collect_detailed(self.detailed(
+            body, stderr="SyntaxError: " + ("token=ghp_secretvalue " * 60), exit_status=0))
+
+        self.assertTrue(loud["error"].startswith(f"{wording}: "))
+        self.assertEqual(len(loud["error"]), bound)
+        self.assertIn("SyntaxError", loud["error"])
+        self.assertNotIn("ghp_secretvalue", loud["error"])
+        self.assert_fail_closed(loud)
 
 
 class RegWindowsStderrDiagnosticTests(unittest.TestCase):
@@ -1932,6 +1998,59 @@ class RegWindowsStderrDiagnosticTests(unittest.TestCase):
         # Nothing and nothing useful never crash, and never invent a reason.
         for value in (None, "", "   \n\t ", 0):
             self.assertEqual(security_scanner.sanitize_remote_diagnostic(value), "")
+
+    def test_reg_win_diag_2_the_verified_gaps_are_closed(self):
+        """
+        REG-REV-WIN-DIAG-002 — six shapes that survived the sanitizer verbatim.
+
+        Each was confirmed against the previous rule set: a `:`-separated
+        credential, a credential word as a SUFFIX of a longer env-var name, a
+        bearer token, the username in `user@host`, a short opaque secret, and a
+        single-segment absolute path. The guard in the second half is the reason
+        this is a fix and not a tightening: closing them must not cost the
+        diagnosis the fragment exists to carry.
+        """
+        gaps = {
+            "colon separated credential": (
+                'OPENAI_API_KEY: "sk-proj-abcdefghijklmnop"', "sk-proj-abcdefghijklmnop"),
+            "credential word as a suffix": (
+                "AWS_SECRET_ACCESS_KEY: AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+            "bearer token": ("Authorization: Bearer sk-abc123xyz", "sk-abc123xyz"),
+            "user at host": ("svc-deploy@203.0.113.10", "svc-deploy"),
+            "short opaque secret": ("hash=deadbeefcafe", "deadbeefcafe"),
+            "single segment path": ("permission denied: /etc", "/etc"),
+        }
+        for label, (text, secret) in gaps.items():
+            with self.subTest(gap=label):
+                cleaned = security_scanner.sanitize_remote_diagnostic(text)
+
+                self.assertNotIn(secret, cleaned)
+                self.assertLessEqual(len(cleaned),
+                                     security_scanner._REMOTE_DIAGNOSTIC_CAP)
+        # `user@host` takes the username; the host it named does not come back
+        # under the IPv4 or dotted-name rules either.
+        self.assertNotIn(
+            "203.0.113.10",
+            security_scanner.sanitize_remote_diagnostic("svc-deploy@203.0.113.10"))
+
+        # SAFE-6: the fragment is a diagnosis, not a blackout.
+        diagnosis = (
+            "Traceback (most recent call last):\n"
+            '  File "run.py", line 1, in <module>\n'
+            "ModuleNotFoundError: No module named 'psutil'\n"
+            "SyntaxError: invalid syntax\n"
+            "IndentationError: unexpected indent\n"
+            "the adapter maps and/or routes input/output"
+        )
+        cleaned = security_scanner.sanitize_remote_diagnostic(diagnosis)
+        for visible in ("Traceback (most recent call last):",
+                        "ModuleNotFoundError: No module named 'psutil'",
+                        "SyntaxError: invalid syntax",
+                        "IndentationError: unexpected indent",
+                        # A slash inside a word is prose, not a path.
+                        "and/or", "input/output"):
+            with self.subTest(visible=visible):
+                self.assertIn(visible, cleaned)
 
     def test_reg_win_transport_3_ssh_run_keeps_its_signature_and_result(self):
         """

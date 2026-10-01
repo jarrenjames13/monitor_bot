@@ -838,37 +838,63 @@ collect_remote = collect_remote_linux
 # A remote interpreter that dies before printing its payload (a missing module, a
 # syntax error, a command line cmd.exe truncated) leaves stdout empty, and stdout
 # alone cannot say why. These patterns reduce that stderr to a short, inert
-# fragment safe to show an operator: no key material, no token, no environment
-# assignment, no absolute path, no username and no hostname ever reaches the
-# report, and the fragment is capped so it cannot crowd out the evidence.
+# fragment safe to show an operator: the classes enumerated below — key material,
+# credential assignments, absolute paths, usernames, host addresses and long
+# unbroken blobs — are redacted on a best-effort basis, so the fragment is not a
+# guarantee of total redaction, and the fragment is capped so it cannot crowd out
+# the evidence.
 _REMOTE_DIAGNOSTIC_CAP = 240
+
+# A credential WORD as one `_`/`-` delimited segment of a name, so it is found
+# wherever it sits in `OPENAI_API_KEY`, `AWS_SECRET_ACCESS_KEY` or `api-key`: a
+# `\b` cannot match after `_`, and a bare substring match would take ordinary
+# words such as "MonkeyError" or "keyboard" with it.
+_CREDENTIAL_SEGMENT = (
+    r"(?:api[_-]?key|access[_-]?key|auth[_-]?orization|passphrase|password|"
+    r"passwd|credential|secret|token|auth|checksum|digest|nonce|signature|"
+    r"sig|bearer|hash|pin|key)"
+)
 
 _REMOTE_DIAGNOSTIC_RULES = (
     # Private key blocks, in full or truncated, are removed before anything else
     # can mistake the body for a path or a bare token.
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)",
                 re.DOTALL), "<key material removed>"),
-    # Environment assignments: NAME=value with a credential-looking or long value.
-    (re.compile(r"(?i)\b([A-Za-z_][A-Za-z0-9_]*(?:key|token|secret|password|passwd|"
-                r"credential|auth)[A-Za-z0-9_]*)\s*=\s*\S+"), r"\1=[redacted]"),
+    # An authorization header carries its secret as the scheme's ARGUMENT, so the
+    # `NAME: value` shape alone would redact the word "Bearer" and leave the
+    # token behind. This runs first for exactly that reason.
+    (re.compile(r"(?i)\b[A-Za-z-]*authorization\s*[:=]\s*"
+                r"(?:basic|bearer|digest|negotiate|token)\s+\S+"),
+     "<authorization removed>"),
+    # Environment assignments: NAME=value or NAME:value with a credential-looking
+    # or long value, where the credential word is any segment of NAME.
+    (re.compile(r"(?i)\b((?:[A-Za-z0-9]+[_-])*" + _CREDENTIAL_SEGMENT
+                + r"(?:[_-][A-Za-z0-9]+)*)\s*[:=]\s*\S+"), r"\1=[redacted]"),
     (re.compile(r"(?i)\b(token|password|passwd|secret|api[_-]?key|access[_-]?key)\b"
                 r"\s*[:=]\s*\S+"), r"\1=[redacted]"),
-    # Windows paths (drive-letter and UNC) and POSIX paths.
+    # Windows paths (drive-letter and UNC) and POSIX paths. The POSIX rule matches
+    # a single segment too, but only at the start of a path: a slash inside a word
+    # ("and/or", "input/output") is prose and is left alone.
     (re.compile(r"[A-Za-z]:\\[^\s'\"]*"), "<path>"),
     (re.compile(r"\\\\[^\s'\"\\]+\\[^\s'\"]*"), "<path>"),
-    (re.compile(r"(?:/[\w.-]+){2,}/?"), "<path>"),
+    (re.compile(r"(?<!\w)(?:/[\w.-]+)+/?"), "<path>"),
     # Usernames in the shapes an SSH or Python error actually uses.
     (re.compile(r"(?i)\b(user|username|login|account)\b\s*[:=]\s*['\"]?[\w.\\/-]+"),
      r"\1=[redacted]"),
     (re.compile(r"(?i)\b(user|username|login|account)\b\s+['\"]?[\w.\\/-]+"),
      r"\1 [redacted]"),
     (re.compile(r"(?i)\bfor\s+user\b\s*['\"]?[\w.\\/-]+"), "for user [redacted]"),
+    # A `user@host` token, before the address rules below, so the username is
+    # removed outright instead of being rewritten while the `@` hangs off it.
+    (re.compile(r"(?i)\b[A-Za-z0-9._-]+@[A-Za-z0-9._-]+"), "<user@host removed>"),
     # Hostnames and addresses: IPv4 first, then IPv6, then dotted names.
     (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"), "<host>"),
     (re.compile(r"\b(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b"), "<host>"),
     (re.compile(r"\b[\w-]{2,}(?:\.[\w-]{2,})+(?::\d+)?\b"), "<host>"),
     # Anything left that is long and unbroken is an opaque blob (a token or an
-    # encoded command), not something to echo into a chat message.
+    # encoded command), not something to echo into a chat message. The threshold
+    # stays high on purpose: short opaque secrets are covered by the credential
+    # words above, so ordinary diagnostic words are never blanked for length.
     (re.compile(r"\b[A-Za-z0-9+/=_-]{32,}\b"), "<blob removed>"),
 )
 
